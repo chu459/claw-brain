@@ -1,13 +1,33 @@
+<div align="center">
+
 # Claw-brain 🧠
 
-> Give OpenClaw a brain that decides for itself.
+**Give OpenClaw a brain that decides for itself.**
 
-OpenClaw gave AI hands and feet — browser automation that follows instructions.
-**Claw-brain gives it a brain that decides what to do next.**
+[![Python](https://img.shields.io/badge/Python-3.13+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/chu459/claw-brain?style=social)](https://github.com/chu459/claw-brain)
+[![Twitter](https://img.shields.io/badge/@Claw__brain-1DA1F2?logo=x&logoColor=white)](https://twitter.com/Claw_brain)
 
-This is the missing piece between "AI can execute tasks" and "AI can figure out what tasks to execute." An autonomous decision engine that runs a self-correcting loop: **Think → Decide → Act → Observe → Think again.**
+</div>
 
-## The Big Picture
+> **English** | [简体中文](#中文介绍)
+
+---
+
+## What is Claw-brain?
+
+OpenClaw gives AI "hands and feet" — browser automation that follows instructions. **Claw-brain gives it a "brain"** that decides what to do next on its own.
+
+This is the missing piece between "AI can execute tasks" and "AI can figure out what tasks to execute."
+
+It's an autonomous decision engine running a self-correcting loop:
+
+```
+Think → Decide → Act → Observe → Think again
+```
+
+### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -26,100 +46,67 @@ This is the missing piece between "AI can execute tasks" and "AI can figure out 
 └─────────────────────────────────────────────────────────┘
 ```
 
-Most AI agents today are **reactive** — they wait for human instructions and execute them. Claw-brain is **proactive** — it sets its own goals, evaluates outcomes, adjusts strategy, and keeps going. autonomously.
+### How It Works
 
-## How It Works
+Each cycle, the Brain:
 
-Every cycle, the Brain:
+1. **Reflect** — Review the goal, accumulated memory, and last step's feedback
+2. **Decide** — Determine the next action (in natural language)
+3. **Send** — Dispatch the instruction to OpenClaw for autonomous browser execution
+4. **Receive** — Get execution results (success or failure)
+5. **Record** — Log experience (what worked, what didn't, why)
+6. **Loop** — Return to step 1 with updated context
 
-1. **Reflects** on the current goal, accumulated memory, and feedback from the last action
-2. **Decides** what to do next — as a natural language instruction
-3. **Sends** the instruction to OpenClaw, which autonomously operates the browser
-4. **Receives** the execution result (success or failure)
-5. **Records** the experience — what worked, what didn't, and why
-6. **Loops back** to step 1 with updated context
+If something fails, the Brain **analyzes why and adjusts strategy** instead of blindly retrying.
 
-If a step fails, the Brain doesn't just retry — it **analyzes the failure and adjusts its entire strategy**. This is not a script with error handling. This is an agent that learns from its own mistakes in real time.
+---
 
-When the Brain needs human input (a phone number, a verification code, a strategic decision), it pauses and asks. Otherwise, it runs.
+## Use Cases
 
-## What Can You Do With This?
+| Goal | Description |
+|------|-------------|
+| **"Help me make money"** | Set a revenue target. The system researches, validates, tests, and iterates autonomously. |
+| **"Get me [N] customers"** | Define target customers. It finds, researches, and tests outreach methods. |
+| **"Grow my business"** | Describe your current state. It researches the market, finds bottlenecks, and does the work. |
+| **"Cut costs to [target]"** | Provide expense data. It identifies waste, finds alternatives, and negotiates. |
+| **"Build and ship [X]"** | Describe what you want to build. It researches, validates, and executes. |
 
-Claw-brain is not a tool for technical people. It's a decision engine for **anyone who has a goal.**
+The pattern is always the same: **you state a measurable goal, the system translates it into actions and closes the gap.**
 
-You don't need to know how AI works. You don't need to write prompts, chain tools, or design workflows. You just tell it what you want — in plain language, the way you'd tell a capable friend — and it figures out the rest.
-
-Some fundamental things people want:
-
-### "Help me make money."
-You set a revenue goal. The system researches what's possible, validates real opportunities, tests approaches, learns from failures, and iterates until something works. You don't plan the steps. You just set the destination.
-
-### "Help me get [N] customers."
-Tell it who your target customer is. It finds where they hang out, studies how they make purchasing decisions, tests different approaches, and iterates until leads start flowing. You review the results, not the process.
-
-### "Help me grow my [business/project]."
-Feed it your current situation. It studies your market, finds your bottleneck, and starts working on it — not reporting about it, actually working on it. Every cycle moves the needle.
-
-### "Help me cut my costs to [target]."
-Give it access to your spending data. It identifies waste, finds cheaper alternatives, negotiates better deals on your behalf, and tracks savings in real time. You see the number go down.
-
-### "Help me build and launch [X]."
-Describe what you want to build. It researches the market, validates the idea, finds the fastest path to a working product, and starts executing. You steer; it builds.
-
-### "Help me find a [job/client/opportunity] that matches [criteria]."
-Set your requirements — salary, location, type, industry. It scans every relevant platform, applies on your behalf, follows up, and brings you only the matches worth your time. You pick. It hunts.
-
-The pattern is the same in every case: **you state a concrete goal with a measurable outcome, the system turns it into action and closes the gap.**
-
-The most powerful application is the one you'll think of when you realize you don't need to understand AI to use it.
-
-## Philosophy
-
-There's a kind of anxiety spreading right now — "AI anxiety." People feel like they need to learn prompting, understand agents, master tools, or get left behind.
-
-**That's wrong.**
-
-AI should serve you the way electricity does. You don't need to understand alternating current to turn on a light. You shouldn't need to understand transformer architecture to make AI work for you.
-
-Claw-brain is built on a belief: **a person with no technical background should be able to walk up to this system, say "help me make money," and become a one-person powerhouse — a super individual — just by stating what they want.**
-
-No learning curve. No prompt engineering. No tool chaining. Just your goal, in your words.
-
-I've watched too many smart people spend their time on operational tasks — copying data, filling forms, checking dashboards, doing things that machines should do. And I've watched too many ordinary people feel paralyzed by AI, convinced it's too complex for them.
-
-Claw-brain exists for both of them. **Your time should be spent on thinking, not clicking.** And you should be able to harness AI without becoming an AI expert.
-
-The final goal isn't "AI that does things." It's **restoring time and freedom to every person** — achieving your goals with the least possible effort, freeing you to live your life instead of operating a computer.
+---
 
 ## Quick Start
 
 ### Prerequisites
+
 - [OpenClaw](https://github.com/nicepkg/openclaw) installed and running (`openclaw gateway run --force`)
-- Python 3.13+
+- Python **3.13+**
 - An LLM API key (DeepSeek, OpenAI, or any OpenAI-compatible API)
 
-### Install
+### Installation
 
 ```bash
 git clone https://github.com/chu459/claw-brain.git
 cd claw-brain
-pip install openai fastapi uvicorn
+pip install -r requirements.txt
 ```
 
-### Configure
-
-Set your environment variables:
+### Configuration
 
 ```bash
-export BRAIN_API_KEY="your-api-key"
-export BRAIN_BASE_URL="https://api.deepseek.com/v1"
-export BRAIN_MODEL="deepseek-chat"
-export OPENCLAW_GATEWAY_URL="http://127.0.0.1:18789"
+# Copy example config
+cp .env.example .env
+
+# Edit .env with your API key
+BRAIN_API_KEY="your-api-key"
+BRAIN_BASE_URL="https://api.deepseek.com/v1"
+BRAIN_MODEL="deepseek-chat"
+OPENCLAW_GATEWAY_URL="http://127.0.0.1:18789"
 ```
 
 ### Run
 
-**Web Console (recommended):**
+**Web Console (Recommended):**
 ```bash
 python web_console.py
 # Open http://127.0.0.1:7860
@@ -127,37 +114,160 @@ python web_console.py
 
 **CLI:**
 ```bash
-python autonomous_system.py --interactive
-# or
 python autonomous_system.py --goal "Your goal here" --loops 50
 ```
 
-## Architecture
+---
+
+## Components
 
 | Component | Role |
 |-----------|------|
-| **Brain** | LLM-powered strategy engine. Receives context, outputs structured decisions (JSON). |
-| **OpenClaw Client** | Bridges to OpenClaw. Translates Brain's natural language decisions into browser actions. |
-| **Memory** | Persistent whiteboard. Records successful patterns, failed attempts, and strategy evolution. |
-| **Web Console** | FastAPI-based dashboard. Real-time monitoring, human-in-the-loop chat, configurable parameters. |
-
-## Key Design Decisions
-
-- **Natural language as the interface between Brain and execution** — no brittle API coupling. The Brain thinks in concepts; OpenClaw acts on instructions. This makes the system resilient to UI changes on target websites.
-- **Failure is data, not an error** — the Brain treats every failed action as input for the next decision, not as a reason to stop.
-- **Human-in-the-loop by exception** — the system only interrupts you when it genuinely can't proceed. Otherwise, it runs.
-- **Memory is the real product** — over time, the accumulated experience becomes more valuable than any single decision.
-
-## License
-
-[AGPL-3.0](LICENSE) — This project uses the GNU Affero General Public License v3.0.
-
-If you use this code (even over a network), you must share your modifications under the same license. This protects the open-source ecosystem from being wrapped into closed SaaS products without giving back.
-
-## Author
-
-Built by [Claw-brain](https://twitter.com/Claw_brain) — 19, building AI that decides for itself.
+| **Brain** | LLM-driven strategy engine. Receives context, outputs structured decisions (JSON) |
+| **OpenClaw Client** | Bridge to OpenClaw. Translates Brain's natural-language decisions into browser operations |
+| **Memory** | Persistent whiteboard. Records successful patterns, failed attempts, and strategy evolution |
+| **Web Console** | FastAPI dashboard. Real-time monitoring, human-in-the-loop chat, configurable parameters |
 
 ---
 
-*"The next step for AI isn't better execution. It's autonomous decision-making."*
+## Key Design Decisions
+
+1. **Natural language as the interface between Brain and execution** — No fragile API coupling. The system is resilient to UI changes on target websites.
+2. **Failure is data, not an error** — The Brain treats every failure as input for its next decision.
+3. **Human-in-the-loop by exception** — Only interrupts you when it truly cannot proceed.
+4. **Memory is the product** — Accumulated experience over time is more valuable than any single decision.
+
+---
+
+## Screenshots
+
+> Screenshots will be added soon. [See Web Console Preview](#)
+
+<!-- ![Web Console Dashboard](assets/web-console.png) -->
+<!-- ![Brain Decision Log](assets/brain-log.png) -->
+
+---
+
+## Roadmap
+
+- [x] Core autonomous loop (Think → Act → Observe → Record)
+- [x] Web console with real-time monitoring
+- [x] Human-in-the-loop chat interface
+- [ ] Multi-agent system (Brain + BD + Content + Dev + Research agents)
+- [ ] Vector memory (replace JSON with semantic search)
+- [ ] Self-healing and error recovery
+- [ ] Docker deployment
+- [ ] Documentation site
+
+---
+
+## Contributing
+
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## License
+
+**AGPL-3.0** — If you use this code (even over a network), you must share modifications under the same license. This protects the open-source ecosystem from being repackaged as a closed-source SaaS.
+
+---
+
+## Philosophy
+
+> AI should serve humanity like electricity — you don't need to understand alternating current to turn on a light.
+
+**No technical background required.** Just state your goal and become a "super-individual." No learning curve, no prompt engineering, no toolchains.
+
+Your time should be spent **thinking**, not clicking.
+
+The ultimate goal isn't "AI does things" — it's **restoring everyone's time and freedom**.
+
+---
+
+Built by [Claw-brain](https://twitter.com/Claw_brain) — 19, building AI that decides for itself.
+
+> *"The next step for AI isn't better execution. It's autonomous decision-making."*
+
+---
+
+<a id="中文介绍"></a>
+
+# Claw-brain 🧠（中文版）
+
+**给 OpenClaw 装上能自主决策的大脑。**
+
+## 什么是 Claw-brain？
+
+OpenClaw 给了 AI "手和脚"—— 让 AI 能按照指令自主操作浏览器。**Claw-brain 给它装上了"大脑"**，让它自己决定下一步该做什么。
+
+这是从"AI 能执行任务"到"AI 能自己找出该执行什么任务"的关键缺失部分。
+
+```
+思考 → 决策 → 执行 → 观察 → 再思考
+```
+
+## 使用场景
+
+| 目标 | 描述 |
+|------|------|
+| **帮我赚钱** | 设定收入目标，系统自动调研、验证、测试、迭代 |
+| **帮我获取 [N] 个客户** | 告诉它目标客户，自动寻找、研究、测试方法 |
+| **帮我发展业务** | 提供现状，自动研究市场、找到瓶颈并执行 |
+| **帮我削减成本** | 给它支出数据，识别浪费、找替代方案 |
+| **帮我构建并发布 [X]** | 描述你要构建的东西，自动调研、验证、执行 |
+
+## 快速开始
+
+```bash
+git clone https://github.com/chu459/claw-brain.git
+cd claw-brain
+pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env 填入你的 API Key
+
+# Web 控制台（推荐）
+python web_console.py
+# 打开 http://127.0.0.1:7860
+```
+
+## 架构组件
+
+| 组件 | 角色 |
+|------|------|
+| **大脑 (Brain)** | LLM 驱动的策略引擎，接收上下文，输出结构化决策 |
+| **小龙虾 (OpenClaw)** | 浏览器自动化执行层，将自然语言指令转化为浏览器操作 |
+| **记忆 (Memory)** | 持久化白板，记录成功/失败经验和策略演进 |
+| **Web 控制台** | FastAPI 仪表盘，实时监控、人机对话、参数配置 |
+
+## 核心设计决策
+
+1. **自然语言作为大脑与执行层之间的接口** — 没有脆弱的 API 耦合，对目标网站 UI 变化具有韧性
+2. **失败是数据，不是错误** — 每次失败都是下一次决策的输入
+3. **按例外进行人机交互** — 只有在真正无法继续时才打断用户
+4. **记忆才是真正的产品** — 随时间积累的经验比任何单次决策更有价值
+
+## 路线图
+
+- [x] 核心自主循环（思考→执行→观察→记录）
+- [x] Web 控制台 + 实时监控
+- [x] 人机对话界面
+- [ ] 多 Agent 系统（大脑 + BD + 内容 + 开发 + 调研）
+- [ ] 向量记忆（替代 JSON 白板）
+- [ ] 自我修复和错误恢复
+- [ ] Docker 一键部署
+- [ ] 文档网站
+
+## 贡献
+
+欢迎贡献！详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 许可证
+
+**AGPL-3.0** — 使用此代码（即使通过网络）必须在相同许可证下共享修改。防止被包装成闭源 SaaS。
+
+---
+
+> 作者：[Claw-brain](https://twitter.com/Claw_brain) — 19岁，正在构建能自主决策的 AI
+>
+> *"AI 的下一步不是更好的执行，而是自主决策。"*
