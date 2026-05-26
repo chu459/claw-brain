@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "agents": [
+    {
+      "id": "brain",
+      "name": "策略大脑",
+      "model": "deepseek-chat",
+      "role": "战略决策中心，分析数据、制定方向、分配任务、评估结果",
+      "personality": "直接、务实、数据驱动、ROI导向",
+      "soulFile": "SOUL.md"
+    },
+    {
+      "id": "bd-agent",
+      "name": "BD执行",
+      "model": "deepseek-chat",
+      "role": "执行邮件BD、社交媒体获客、客户跟进",
+      "parent": "brain"
+    },
+    {
+      "id": "content-agent",
+      "name": "内容生产",
+      "model": "deepseek-chat",
+      "role": "生成视频脚本、图文内容、演示案例",
+      "parent": "brain"
+    },
+    {
+      "id": "dev-agent",
+      "name": "产品开发",
+      "model": "deepseek-chat",
+      "role": "代码开发、产品部署、Bug修复、功能迭代",
+      "parent": "brain"
+    },
+    {
+      "id": "research-agent",
+      "name": "市场研究",
+      "model": "deepseek-chat",
+      "role": "竞品分析、市场趋势、用户需求调研",
+      "parent": "brain"
+    }
+  ],
+  "routing": {
+    "mode": "hierarchical",
+    "defaultAgent": "brain",
+    "rules": [
+      {
+        "pattern": "写代码|开发|部署|修复|Bug|功能",
+        "target": "dev-agent"
+      },
+      {
+        "pattern": "内容|文案|脚本|视频|图文",
+        "target": "content-agent"
+      },
+      {
+        "pattern": "获客|BD|邮件|客户|销售",
+        "target": "bd-agent"
+      },
+      {
+        "pattern": "调研|分析|竞品|市场|趋势",
+        "target": "research-agent"
+      }
+    ]
+  }
+}

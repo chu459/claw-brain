@@ -143,8 +143,7 @@ python autonomous_system.py --goal "Your goal here" --loops 50
 
 > Screenshots will be added soon. [See Web Console Preview](#)
 
-<!-- ![Web Console Dashboard](assets/web-console.png) -->
-<!-- ![Brain Decision Log](assets/brain-log.png) -->
+![Web Console Dashboard](assets/web-console.png)
 
 ---
 
