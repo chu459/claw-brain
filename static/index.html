@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claw-brain 自主赚钱系统</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 左侧控制面板 -->
+    <aside id="sidebar">
+      <div class="logo-row">
+        <div class="logo">M</div>
+        <div class="logo-text">
+          <h1>自主赚钱系统</h1>
+          <p>Claw-brain v2</p>
+        </div>
+      </div>
+
+      <section class="card">
+        <h2 class="card-label">系统状态</h2>
+        <div class="status-row">
+          <span class="dot" id="system-dot"></span>
+          <span class="status-label" id="system-status">待命中</span>
+        </div>
+        <div class="status-row">
+          <span class="dot dot-green" id="brain-dot"></span>
+          <span class="status-label">AI 大脑</span>
+          <span class="status-value" id="brain-model">DeepSeek</span>
+        </div>
+        <div class="status-row">
+          <span class="dot dot-green" id="gateway-dot"></span>
+          <span class="status-label">小龙虾 Gateway</span>
+          <span class="status-value">:18789</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-label">目标设定</h2>
+        <textarea id="goal-input" class="input" rows="4" placeholder="输入你的终极目标...">分析当前获客渠道，找到转化率最高的方式并持续放大，直到产生真实收入。</textarea>
+      </section>
+
+      <section class="card">
+        <h2 class="card-label">参数配置</h2>
+        <div class="form-row">
+          <label>Agent</label>
+          <select id="agent-select" class="input">
+            <option value="main">main</option>
+            <option value="brain">brain</option>
+            <option value="content-agent">content-agent</option>
+            <option value="research-agent">research-agent</option>
+            <option value="dev-agent">dev-agent</option>
+            <option value="bd-agent">bd-agent</option>
+          </select>
+        </div>
+        <div class="form-row form-row-inline">
+          <label>最大轮数</label>
+          <input id="max-loops" type="number" class="input input-number" value="10" min="1" max="999">
+          <label>间隔(秒)</label>
+          <input id="loop-interval" type="number" class="input input-number" value="15" min="5" max="300">
+        </div>
+      </section>
+
+      <button id="start-btn" class="btn btn-primary">启动系统</button>
+
+      <section class="card">
+        <h2 class="card-label">快速目标</h2>
+        <div class="quick-goals">
+          <button class="quick-btn" data-goal="获客">获客分析 — 找到转化率最高的渠道</button>
+          <button class="quick-btn" data-goal="定价">定价调研 — Gumroad AI prompt 竞品分析</button>
+          <button class="quick-btn" data-goal="Reddit">Reddit 挖掘 — AI automation 赚钱成功案例</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- 右侧主面板 -->
+    <main id="main">
+      <nav class="tabs">
+        <button class="tab active" data-panel="brain">
+          <span class="tab-icon">🧠</span> AI 大脑思考板
+        </button>
+        <button class="tab" data-panel="claw">
+          <span class="tab-icon">🦞</span> 小龙虾监控
+        </button>
+        <button class="tab" data-panel="memory">
+          <span class="tab-icon">💾</span> 记忆白板
+        </button>
+      </nav>
+
+      <!-- Brain 面板 -->
+      <section class="panel active" id="panel-brain">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon icon-brain">🧠</span>
+            <span>AI 大脑</span>
+          </div>
+          <span class="badge" id="round-badge">Round 0</span>
+        </header>
+        <div class="panel-body" id="brain-body">
+          <div class="empty-state">
+            <div class="empty-icon">🧠</div>
+            <div class="empty-text">AI 大脑等待启动</div>
+            <div class="empty-hint">设定目标后点击「启动系统」</div>
+          </div>
+        </div>
+        <footer class="panel-footer">
+          <span>模型: <strong>DeepSeek</strong></span>
+          <span>API: <strong>DeepSeek 官方</strong></span>
+          <span>角色: <strong>策略大脑</strong></span>
+        </footer>
+      </section>
+
+      <!-- Claw 面板 -->
+      <section class="panel" id="panel-claw">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon icon-claw">🦞</span>
+            <span>小龙虾 OpenClaw</span>
+          </div>
+          <span class="badge badge-green" id="claw-badge">0 次执行</span>
+        </header>
+        <div class="panel-body" id="claw-body">
+          <div class="empty-state">
+            <div class="empty-icon">🦞</div>
+            <div class="empty-text">小龙虾待命中</div>
+            <div class="empty-hint">系统启动后将显示执行记录</div>
+          </div>
+        </div>
+        <footer class="panel-footer">
+          <span>Agent: <strong id="footer-agent">main</strong></span>
+          <span>Gateway: <strong>:18789</strong></span>
+          <span>模式: <strong>CLI</strong></span>
+        </footer>
+      </section>
+
+      <!-- Memory 面板 -->
+      <section class="panel" id="panel-memory">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span class="panel-icon icon-memory">📋</span>
+            <span>记忆白板</span>
+          </div>
+        </header>
+        <div class="panel-body" id="memory-body">
+          <div class="empty-state">
+            <div class="empty-text">白板是空的</div>
+          </div>
+        </div>
+        <footer class="panel-footer">
+          <span>存储: <strong>JSON 文件</strong></span>
+          <span>容量: <strong>最近 50 条</strong></span>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <!-- 浮动对话按钮 -->
+  <div id="chat-fab">
+    <div id="chat-panel" class="hidden">
+      <div class="chat-header">
+        <div class="chat-icon">🧠</div>
+        <div>
+          <div class="chat-title">系统对话</div>
+          <div class="chat-subtitle">系统需要你输入时会弹窗通知</div>
+        </div>
+        <button id="chat-close">&times;</button>
+      </div>
+      <div class="chat-body" id="chat-body">
+        <div class="chat-empty">暂无对话</div>
+      </div>
+      <div class="chat-footer">
+        <input id="chat-input" class="chat-input" placeholder="输入你的回复..." autocomplete="off">
+        <button id="chat-send" class="chat-send">➤</button>
+      </div>
+    </div>
+    <button id="chat-toggle" class="chat-toggle">💬</button>
+    <span id="chat-badge" class="chat-badge hidden">0</span>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
