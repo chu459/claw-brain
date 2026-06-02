@@ -1,0 +1,248 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - link "Skip to content" [ref=e4] [cursor=pointer]:
+      - /url: "#start-of-content"
+    - generic [ref=e7]:
+      - banner "Global Navigation Menu" [ref=e8]:
+        - generic [ref=e9]:
+          - generic [ref=e10]:
+            - button "Open menu" [ref=e12] [cursor=pointer]:
+              - img [ref=e13]
+            - link "Homepage (g then d)" [ref=e15] [cursor=pointer]:
+              - /url: /
+              - img [ref=e16]
+          - generic [ref=e18]:
+            - navigation "Breadcrumbs" [ref=e19]:
+              - list [ref=e20]:
+                - listitem [ref=e21]:
+                  - link "chu459" [ref=e22] [cursor=pointer]:
+                    - /url: /chu459
+                    - generic [ref=e23]: chu459
+                - listitem [ref=e24]:
+                  - link "claw-brain" [ref=e25] [cursor=pointer]:
+                    - /url: /chu459/claw-brain
+                    - generic [ref=e26]: claw-brain
+            - button "Search or jump to…" [ref=e29] [cursor=pointer]:
+              - generic [ref=e30]:
+                - generic:
+                  - img
+                - generic [ref=e31]:
+                  - generic:
+                    - text: Type
+                    - generic: /
+                    - text: to search
+          - generic [ref=e32]:
+            - generic [ref=e33]:
+              - generic [ref=e36]:
+                - link "Chat with Copilot" [ref=e38] [cursor=pointer]:
+                  - /url: /copilot
+                  - img [ref=e39]
+                - button "Open Copilot…" [ref=e43] [cursor=pointer]:
+                  - generic:
+                    - img
+              - button "Create new..." [ref=e45] [cursor=pointer]:
+                - generic [ref=e46]:
+                  - generic:
+                    - img
+                - generic:
+                  - img
+              - generic [ref=e47]:
+                - link "All issues" [ref=e48] [cursor=pointer]:
+                  - /url: /issues
+                  - img [ref=e49]
+                - link "All pull requests" [ref=e52] [cursor=pointer]:
+                  - /url: /pulls
+                  - img [ref=e53]
+                - link "All repositories" [ref=e55] [cursor=pointer]:
+                  - /url: /repos
+                  - img [ref=e56]
+            - link "You have unread notifications (g then n)" [ref=e230] [cursor=pointer]:
+              - /url: /notifications
+              - img [ref=e59]
+            - button "Open user navigation menu" [ref=e62] [cursor=pointer]:
+              - img "User avatar" [ref=e63]
+        - heading "Repository navigation" [level=2] [ref=e64]
+        - navigation "Repository" [ref=e65]:
+          - list [ref=e66]:
+            - listitem [ref=e67]:
+              - link "Code" [ref=e68] [cursor=pointer]:
+                - /url: /chu459/claw-brain
+                - img [ref=e70]
+                - generic [ref=e72]: Code
+            - listitem [ref=e73]:
+              - link "Issues" [ref=e74] [cursor=pointer]:
+                - /url: /chu459/claw-brain/issues
+                - img [ref=e76]
+                - generic [ref=e79]: Issues
+            - listitem [ref=e80]:
+              - link "Pull requests" [ref=e81] [cursor=pointer]:
+                - /url: /chu459/claw-brain/pulls
+                - img [ref=e83]
+                - generic [ref=e85]: Pull requests
+            - listitem [ref=e86]:
+              - link "Agents" [ref=e87] [cursor=pointer]:
+                - /url: /chu459/claw-brain/agents?author=chu459
+                - img [ref=e89]
+                - generic [ref=e92]: Agents
+            - listitem [ref=e93]:
+              - link "Actions" [ref=e94] [cursor=pointer]:
+                - /url: /chu459/claw-brain/actions
+                - img [ref=e96]
+                - generic [ref=e98]: Actions
+            - listitem [ref=e99]:
+              - link "Projects" [ref=e100] [cursor=pointer]:
+                - /url: /chu459/claw-brain/projects
+                - img [ref=e102]
+                - generic [ref=e104]: Projects
+            - listitem [ref=e105]:
+              - link "Wiki" [ref=e106] [cursor=pointer]:
+                - /url: /chu459/claw-brain/wiki
+                - img [ref=e108]
+                - generic [ref=e110]: Wiki
+            - listitem [ref=e111]:
+              - link "Security and quality" [ref=e112] [cursor=pointer]:
+                - /url: /chu459/claw-brain/security
+                - img [ref=e114]
+                - generic [ref=e116]: Security and quality
+            - listitem [ref=e117]:
+              - link "Insights" [ref=e118] [cursor=pointer]:
+                - /url: /chu459/claw-brain/pulse
+                - img [ref=e120]
+                - generic [ref=e122]: Insights
+            - listitem [ref=e123]:
+              - link "Settings" [ref=e124] [cursor=pointer]:
+                - /url: /chu459/claw-brain/settings
+                - img [ref=e126]
+                - generic [ref=e128]: Settings
+      - region "Important update" [ref=e130]:
+        - img [ref=e132]
+        - generic [ref=e135]:
+          - heading "Important update" [level=2] [ref=e137]
+          - generic [ref=e139]:
+            - text: On April 24 we'll start using GitHub Copilot interaction data for AI model training unless you opt out.
+            - link "Review this update" [ref=e140] [cursor=pointer]:
+              - /url: https://gh.io/AAzfaht
+            - text: and manage your preferences in your
+            - link "GitHub account settings" [ref=e141] [cursor=pointer]:
+              - /url: https://github.com/settings/copilot/features
+            - text: .
+        - button "Dismiss banner" [ref=e142] [cursor=pointer]:
+          - img [ref=e143]
+  - main [ref=e148]:
+    - generic [ref=e156]:
+      - generic [ref=e158]:
+        - generic [ref=e161]:
+          - generic [ref=e162]:
+            - generic [ref=e163]:
+              - heading "Collapse file tree" [level=2] [ref=e164]:
+                - button "Collapse file tree" [expanded] [ref=e165] [cursor=pointer]:
+                  - img [ref=e166]
+              - heading "Files" [level=2] [ref=e169]
+            - generic [ref=e170]:
+              - button "main branch" [ref=e172] [cursor=pointer]:
+                - generic [ref=e173]:
+                  - generic [ref=e175]:
+                    - img [ref=e177]
+                    - generic [ref=e180]: main
+                  - generic:
+                    - img
+              - generic [ref=e181]:
+                - link "Add file" [ref=e182] [cursor=pointer]:
+                  - /url: /chu459/claw-brain/new/main
+                  - img [ref=e183]
+                - button "Search this repository (forward slash)" [ref=e185] [cursor=pointer]:
+                  - img [ref=e186]
+          - generic [ref=e189]:
+            - img [ref=e191]
+            - combobox "Go to file" [ref=e193]
+            - generic [ref=e196]:
+              - generic [ref=e197]: t
+              - generic [ref=e198]: T
+          - navigation "File Tree Navigation" [ref=e204]:
+            - tree "Files" [ref=e206]:
+              - treeitem "LICENSE" [level=1] [ref=e207]:
+                - generic [ref=e209] [cursor=pointer]:
+                  - img [ref=e212]
+                  - generic [ref=e214]: LICENSE
+        - slider "Draggable pane splitter" [ref=e216]
+      - generic [ref=e221]:
+        - heading "Creating a new file in claw-brain" [level=1] [ref=e231]
+        - generic [ref=e232]:
+          - generic [ref=e234]:
+            - navigation "Breadcrumbs" [ref=e236]:
+              - heading "Breadcrumbs" [level=2] [ref=e237]
+              - list [ref=e238]:
+                - listitem [ref=e239]:
+                  - link "claw-brain" [ref=e240] [cursor=pointer]:
+                    - /url: /chu459/claw-brain/tree/main
+            - generic [ref=e241]:
+              - generic [ref=e242]: /
+              - textbox "File name" [active] [ref=e244]:
+                - /placeholder: Name your file...
+                - text: README.md
+              - generic [ref=e245]: in
+              - link "main" [ref=e246] [cursor=pointer]:
+                - /url: /chu459/claw-brain/tree/main
+          - generic [ref=e247]:
+            - link "Cancel changes" [ref=e248] [cursor=pointer]:
+              - /url: /chu459/claw-brain/tree/main
+              - generic [ref=e250]: Cancel changes
+            - button "Commit changes..." [ref=e251] [cursor=pointer]:
+              - generic [ref=e253]: Commit changes...
+        - generic [ref=e255]:
+          - generic [ref=e257]:
+            - list "Edit mode" [ref=e258]:
+              - listitem [ref=e259]:
+                - button "Edit" [ref=e260] [cursor=pointer]:
+                  - generic [ref=e262]: Edit
+              - listitem [ref=e263]:
+                - button "Preview" [ref=e264] [cursor=pointer]:
+                  - generic [ref=e266]: Preview
+            - generic [ref=e268]:
+              - generic [ref=e269]:
+                - generic [ref=e270] [cursor=pointer]: Indent mode
+                - generic [ref=e271]:
+                  - combobox "Indent mode" [ref=e272] [cursor=pointer]:
+                    - option "Spaces" [selected]
+                    - option "Tabs"
+                  - img
+              - generic [ref=e273]:
+                - generic [ref=e274] [cursor=pointer]: Indent size
+                - generic [ref=e275]:
+                  - combobox "Indent size" [ref=e276] [cursor=pointer]:
+                    - option "2" [selected]
+                    - option "4"
+                    - option "8"
+                  - img
+              - generic [ref=e277]:
+                - generic [ref=e278] [cursor=pointer]: Line wrap mode
+                - generic [ref=e279]:
+                  - combobox "Line wrap mode" [ref=e280] [cursor=pointer]:
+                    - option "No wrap" [selected]
+                    - option "Soft wrap"
+                  - img
+          - generic [ref=e282]:
+            - generic [ref=e283]: Editing README.md file contents
+            - generic [ref=e285]:
+              - region "Editing README.md file contents" [ref=e298]:
+                - generic [ref=e289]: "1"
+                - textbox "Editing README.md file contents Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page." [ref=e299]:
+                  - generic [ref=e291]:
+                    - generic: Enter file contents here
+              - generic [ref=e300]:
+                - text: Use
+                - generic [ref=e301]: Control + Shift + m
+                - text: to toggle the
+                - generic [ref=e302]: tab
+                - text: key moving focus. Alternatively, use
+                - generic [ref=e303]: esc
+                - text: then
+                - generic [ref=e304]: tab
+                - text: to move to the next interactive element on the page.
+            - generic [ref=e305]:
+              - button "Attach files by dragging & dropping, selecting or pasting them. Styling with Markdown is supported" [ref=e306] [cursor=pointer]
+              - generic:
+                - generic: Attach files by dragging & dropping, selecting or pasting them.
+              - link "Styling with Markdown is supported" [ref=e307] [cursor=pointer]:
+                - /url: https://docs.github.com/github/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax
+                - img [ref=e308]

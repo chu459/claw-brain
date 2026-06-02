@@ -9,12 +9,18 @@ FastAPI 后端 + 自定义 HTML 前端
 """
 
 import json
+import asyncio
 import threading
 import time
 import queue
 import os
 import sys
+import socket
+import shutil
+import subprocess
+import uuid
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -35,29 +41,223 @@ if _env_file.exists():
 
 # 确保能导入核心模块
 sys.path.insert(0, str(Path(__file__).parent))
-from autonomous_system import OpenClawClient, Brain, Memory
+from autonomous_system import OpenClawClient, Brain, Memory, GOAL_TEMPLATES, OUTPUT_DIR, OutputManager
+from credential_store import (
+    list_accounts, get_account, add_account, update_account,
+    delete_account, get_credential_value, ACCOUNT_TEMPLATES, PRESET_FIELDS,
+)
+from core import SystemState, RunLoopConfig, run_loop as _core_run_loop, SessionManager
+from task_manager import get_task_manager, TaskManager
 
 # ===================== 配置 =====================
-BRAIN_API_KEY = os.environ.get("BRAIN_API_KEY", "")
-BRAIN_BASE_URL = os.environ.get("BRAIN_BASE_URL", "https://api.deepseek.com/v1")
-BRAIN_MODEL = os.environ.get("BRAIN_MODEL", "deepseek-chat")
+BRAIN_API_KEY = os.environ.get("BRAIN_API_KEY", "") or (get_credential_value("DeepSeek", "api_key") or "")
+BRAIN_BASE_URL = os.environ.get("BRAIN_BASE_URL", "https://api.deepseek.com/v1") or (get_credential_value("DeepSeek", "base_url") or "https://api.deepseek.com/v1")
+BRAIN_MODEL = os.environ.get("BRAIN_MODEL", "deepseek-chat") or (get_credential_value("DeepSeek", "model") or "deepseek-chat")
 OPENCLAW_GATEWAY_URL = os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
 SESSION_KEY = "autonomous-money-maker"
 MEMORY_FILE = str(Path(__file__).parent / "system_memory.json")
 
+# 产物管理器
+output_manager = OutputManager(OUTPUT_DIR)
+
 AGENTS = ["main", "brain", "content-agent", "research-agent", "dev-agent", "bd-agent"]
 
-# ===================== 全局状态 =====================
-state_lock = threading.Lock()
-system_running = False
-loop_count = 0
-event_queue: queue.Queue = queue.Queue()
-brain_log: list = []
-claw_log: list = []
-chat_history: list = []       # 对话历史 [{"role":"sys"|"usr", "text":"..."}]
-pending_question: str = ""    # 当前等待回答的问题（空=无）
-answer_event = threading.Event()  # 通知 run_loop 用户已回复
-user_answer: str = ""         # 用户的回复内容
+# ===================== 闲置检测 =====================
+LAST_ACTIVITY_TIME = time.time()  # 每次 API 调用自动更新
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("CLAWBRAIN_IDLE_TIMEOUT", "1800"))  # 默认 30 分钟
+
+# ===================== 进程隔离架构 =====================
+# Web Server 和 Worker 完全分离：
+#   - Web Server：纯 async FastAPI，只读快照文件，不做任何重计算
+#   - Worker：独立 Python 进程，运行 run_loop，每 3 秒写入快照
+#   - 通信：pipe/snapshot.json（Worker→Server）+ pipe/command.json（Server→Worker）
+
+PIPE_DIR = Path(__file__).parent / "pipe"
+PIPE_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR = Path(__file__).parent / "sessions"
+SNAPSHOT_FILE = PIPE_DIR / "snapshot.json"
+COMMAND_FILE = PIPE_DIR / "command.json"
+
+# Worker 子进程引用（这是唯一保留的全局状态——进程本身）
+_worker_process: subprocess.Popen | None = None
+_worker_log_file = None  # Worker stdout 日志文件句柄，必须保持引用防止 GC 关闭 fd
+
+# 快照缓存（减少文件读取次数）
+_snapshot_cache = {"data": None, "ts": 0}
+_SNAPSHOT_CACHE_TTL = 0.8  # 0.8秒缓存
+
+# 没有运行任务时暂存的用户消息
+pending_user_feedbacks: list[dict] = []
+
+# 会话管理器
+session_mgr = SessionManager()
+
+
+def _read_snapshot() -> dict:
+    """读取 Worker 快照（带缓存）"""
+    now = time.time()
+    if now - _snapshot_cache["ts"] < _SNAPSHOT_CACHE_TTL and _snapshot_cache["data"]:
+        return _snapshot_cache["data"]
+    if not SNAPSHOT_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+        _snapshot_cache["data"] = data
+        _snapshot_cache["ts"] = now
+        return data
+    except Exception:
+        return _snapshot_cache["data"] or {}
+
+
+def _send_command(cmd: dict):
+    """发送命令给 Worker（原子写入）"""
+    tmp = COMMAND_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(COMMAND_FILE)
+
+
+def _pid_exists(pid: int) -> bool:
+    """跨平台检测 PID 是否存在（OS 级别）"""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        # Windows: 用 OpenProcess 检测
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                # 检查进程是否还在跑（不是已退出但句柄未释放）
+                exit_code = ctypes.c_ulong()
+                ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                ctypes.windll.kernel32.CloseHandle(handle)
+                # 259 = STILL_ACTIVE
+                return exit_code.value == 259
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def _is_worker_alive() -> bool:
+    """检查 Worker 是否真的在工作。
+    
+    判断标准（多重）：
+    1. 优先：内存中的 _worker_process 存活
+    2. 兜底：快照里的 PID 在 OS 中存活，且 last_update 在 30 秒内
+    
+    后者解决：Web Server 重启后 _worker_process=None，但旧 Worker 进程还在的情况
+    """
+    global _worker_process
+    # 内存变量在 → 这个进程是我们启动的，最可信
+    if _worker_process is not None:
+        return _worker_process.poll() is None
+
+    # 内存变量没有 → 检查快照里有没有遗留 Worker
+    snap = _read_snapshot()
+    if not snap:
+        return False
+    pid = snap.get("pid", 0)
+    last_update = snap.get("last_update", 0)
+    # PID 在 OS 中存活 且 心跳在 30 秒内 = 真在跑
+    if _pid_exists(pid) and (time.time() - last_update) < 30:
+        return True
+    return False
+
+
+def _kill_orphan_worker() -> bool:
+    """杀掉遗留的 Worker 进程（Web Server 重启后可能存在）。返回是否真的杀了"""
+    snap = _read_snapshot()
+    if not snap:
+        return False
+    pid = snap.get("pid", 0)
+    if pid and _pid_exists(pid):
+        try:
+            if os.name == "nt":
+                import ctypes
+                PROCESS_TERMINATE = 0x0001
+                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if handle:
+                    ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    print(f"[CLEANUP] 杀掉遗留 Worker PID={pid}")
+                    return True
+            else:
+                os.kill(pid, 9)
+                print(f"[CLEANUP] 杀掉遗留 Worker PID={pid}")
+                return True
+        except Exception as e:
+            print(f"[CLEANUP] 杀掉遗留 Worker 失败: {e}")
+    return False
+
+
+def _atomic_write_snapshot(data: dict):
+    """原子写入快照文件"""
+    tmp = SNAPSHOT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SNAPSHOT_FILE)
+
+
+def _read_last_session_from_disk() -> dict | None:
+    """从 Sessions 目录读取最近一个有日志的 Session"""
+    sessions_dir = Path(__file__).parent / "sessions"
+    if not sessions_dir.exists():
+        return None
+    # 读 index 获取 session 顺序
+    index_file = sessions_dir / "index.json"
+    if not index_file.exists():
+        return None
+    try:
+        idx = json.loads(index_file.read_text(encoding="utf-8"))
+        if not idx:
+            return None
+        # 倒序找最近一个有实际日志的
+        for entry in reversed(idx):
+            sess_file = sessions_dir / f"{entry['id']}.json"
+            if sess_file.exists():
+                try:
+                    d = json.loads(sess_file.read_text(encoding="utf-8"))
+                    if d.get("brain_log") or d.get("claw_log"):
+                        d["session_id"] = entry["id"]
+                        d["loop_count"] = entry.get("loop_count", 0)
+                        return d
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _atomic_write_snapshot(data: dict):
+    """原子写入快照文件"""
+    tmp = SNAPSHOT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SNAPSHOT_FILE)
+
+
+def _cleanup_dead_worker():
+    """清理已退出的 Worker 进程"""
+    global _worker_process
+    if _worker_process and _worker_process.poll() is not None:
+        # Worker 已退出
+        exit_code = _worker_process.returncode
+        stdout = ""
+        try:
+            stdout = _worker_process.stdout.read()[-2000:] if _worker_process.stdout else ""
+        except Exception:
+            pass
+        if exit_code != 0:
+            print(f"[WORKER] Worker 进程退出 code={exit_code}")
+            if stdout:
+                print(f"[WORKER] stdout: {stdout[:500]}")
+        _worker_process = None
 
 
 # ===================== HTML =====================
@@ -73,7 +273,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
 .logo-row{display:flex;align-items:center;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border)}
 .logo{width:38px;height:38px;background:linear-gradient(135deg,#ff5c5c,#ff8c5c);border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;font-weight:800;flex-shrink:0;font-family:var(--font)}
 .logo-text h1{color:var(--text-strong);font-size:17px;font-weight:700;line-height:1.2}
-.logo-text p{color:var(--muted);font-size:11px;margin-top:2px}
+.logo-text p{color:var(--accent);font-size:13px;margin-top:3px;font-weight:600;letter-spacing:.5px}
+.dev-tag{color:var(--muted);font-size:10px;margin-top:2px;display:block}
 
 /* === 卡片 === */
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px}
@@ -107,10 +308,50 @@ textarea.inp:focus,select.inp:focus,input.inp:focus{border-color:var(--accent)}
 .btn-go:hover{box-shadow:0 6px 24px rgba(255,92,92,.4);transform:translateY(-1px)}
 .btn-stop{background:var(--bg-hover);color:var(--accent);border:1px solid var(--accent-subtle)}
 .btn-stop:hover{background:var(--accent-subtle)}
+.mode-btn{background:var(--bg-elevated);border:1px solid var(--border);color:var(--text)!important;padding:10px 12px;font-size:13px;font-weight:600;width:auto}
+.mode-btn:hover{border-color:var(--accent)!important;color:var(--accent)!important}
+.mode-active{border-color:var(--accent)!important;color:var(--accent)!important;background:rgba(255,92,92,0.1)!important}
 
 /* === 快速目标 === */
 .qbtn{background:var(--bg-hover);border:1px solid var(--border-strong);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;cursor:pointer;text-align:left;transition:all .2s;font-family:var(--font);width:100%}
 .qbtn:hover{border-color:rgba(255,92,92,.3);background:var(--bg-elevated)}
+
+/* === 账号管理 === */
+.cred-list{display:flex;flex-direction:column;gap:6px;max-height:200px;overflow-y:auto}
+.cred-item{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg-hover);border-radius:8px;cursor:pointer;transition:all .15s;border:1px solid transparent}
+.cred-item:hover{border-color:var(--border-strong);background:var(--bg-elevated)}
+.cred-info{display:flex;align-items:center;gap:8px;min-width:0}
+.cred-icon{font-size:16px;flex-shrink:0}
+.cred-name{font-size:12px;color:var(--text-strong);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cred-cat{font-size:10px;color:var(--muted)}
+.cred-actions{display:flex;gap:4px;flex-shrink:0}
+.cred-btn{background:0 0;border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:11px;cursor:pointer;padding:2px 8px;transition:all .15s;font-family:var(--font)}
+.cred-btn:hover{color:var(--text);border-color:var(--border-strong)}
+.cred-btn.del:hover{color:var(--danger);border-color:var(--danger)}
+.cred-empty{color:var(--muted);font-size:11px;text-align:center;padding:12px 0}
+.cred-add-btn{width:100%;padding:8px;border:1px dashed var(--border-strong);border-radius:8px;background:0 0;color:var(--muted);font-size:12px;cursor:pointer;transition:all .15s;font-family:var(--font);margin-top:6px}
+.cred-add-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+/* === 凭据弹窗 === */
+.cred-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.cred-modal{background:var(--bg-accent);border:1px solid var(--border-strong);border-radius:var(--radius-lg);padding:24px;width:min(460px,90vw);max-height:80vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.cred-modal h3{color:var(--text-strong);font-size:16px;margin:0 0 16px;font-weight:700}
+.cred-field{margin-bottom:12px}
+.cred-field label{display:block;color:var(--muted);font-size:11px;font-weight:600;margin-bottom:4px;letter-spacing:.05em}
+.cred-field input,.cred-field select{width:100%;padding:8px 12px;background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-family:var(--font);box-sizing:border-box;outline:0;transition:border-color .15s}
+.cred-field input:focus,.cred-field select:focus{border-color:var(--accent)}
+.cred-field select{cursor:pointer;appearance:auto}
+.cred-modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
+.cred-modal-btns button{padding:8px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:var(--font);border:none}
+.cred-btn-cancel{background:var(--bg-hover);color:var(--text)}
+.cred-btn-cancel:hover{background:var(--bg-elevated)}
+.cred-btn-save{background:var(--accent);color:#fff}
+.cred-btn-save:hover{background:var(--accent-hover)}
+.cred-dynamic-fields{display:flex;flex-direction:column;gap:8px}
+.cred-field-row{display:flex;gap:8px;align-items:end}
+.cred-field-row input{flex:1}
+.cred-field-row button{background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;color:var(--danger);font-size:11px;cursor:pointer;padding:8px 10px;flex-shrink:0}
+.cred-field-row button:hover{background:var(--accent-subtle)}
 
 /* === 右侧面板 === */
 #right{background:var(--bg);padding:24px;display:flex;flex-direction:column;gap:18px;overflow:hidden}
@@ -151,6 +392,10 @@ textarea.inp:focus,select.inp:focus,input.inp:focus{border-color:var(--accent)}
 .result-box{margin-top:8px;padding:8px 10px;border-radius:6px;font-size:12px;line-height:1.5}
 .result-ok{background:rgba(34,197,94,.06);color:var(--ok);border-left:2px solid rgba(34,197,94,.25)}
 .result-fail{background:rgba(239,68,68,.06);color:var(--danger);border-left:2px solid rgba(239,68,68,.25)}
+
+/* === 质量评审 === */
+.quality-review{border-left:3px solid var(--warn)!important;padding-left:12px;margin-left:4px}
+.quality-score{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);border-radius:8px;padding:8px 12px;margin-top:8px;font-size:12px;line-height:1.6;color:var(--warn)}
 
 /* === 记忆卡片 === */
 .mem-card{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 14px;margin-bottom:10px}
@@ -209,6 +454,49 @@ textarea.inp:focus,select.inp:focus,input.inp:focus{border-color:var(--accent)}
 .chat-send{width:38px;height:38px;border-radius:8px;border:none;background:linear-gradient(135deg,var(--purple-light),var(--purple));color:#fff;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0}
 .chat-send:hover{transform:scale(1.05);box-shadow:0 2px 12px rgba(83,74,183,.4)}
 .chat-send:disabled{opacity:.4;cursor:not-allowed;transform:none}
+
+/* === 目标标签 === */
+.goal-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.goal-tag{display:inline-flex;align-items:center;gap:4px;padding:5px 10px;background:var(--bg-hover);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--text);cursor:pointer;transition:all .15s;max-width:100%}
+.goal-tag:hover{border-color:var(--accent);color:var(--accent)}
+.goal-tag .x{font-size:13px;color:var(--muted);cursor:pointer;margin-left:2px;opacity:0;transition:opacity .15s}
+.goal-tag:hover .x{opacity:1}
+.goal-tag .x:hover{color:var(--danger)}
+.goal-save{background:0 0;border:1px dashed var(--border-strong);border-radius:6px;color:var(--muted);font-size:11px;cursor:pointer;padding:5px 10px;transition:all .15s;font-family:var(--font);margin-top:10px}
+.goal-save:hover{border-color:var(--accent);color:var(--accent)}
+
+/* === 任务历史栏 === */
+.sess-bar{display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--bg-accent);border:1px solid var(--border);border-radius:var(--radius-md);flex-shrink:0;min-height:40px}
+.sess-bar::-webkit-scrollbar{height:4px}
+.sess-bar::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:2px}
+.sess-bar .sess-new-btn{order:-1;flex-shrink:0}
+.sess-sessions{display:flex;align-items:center;gap:6px;overflow-x:auto;flex:1;min-width:0}
+.sess-sessions::-webkit-scrollbar{height:4px}
+.sess-sessions::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:2px}
+.sess-chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;background:var(--bg-hover);border:1px solid var(--border);border-radius:20px;font-size:11px;color:var(--text);cursor:pointer;white-space:nowrap;transition:all .15s;flex-shrink:0}
+.sess-chip:hover{border-color:var(--border-strong);background:var(--bg-elevated)}
+.sess-chip.active{border-color:var(--accent);color:var(--accent);background:rgba(255,92,92,.08)}
+.sess-chip .sess-time{color:var(--muted);font-size:10px}
+.sess-chip .sess-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sess-chip .sess-dot.stopped{background:var(--muted)}
+.sess-chip .sess-dot.running{background:var(--ok);box-shadow:0 0 6px rgba(34,197,94,.4);animation:pulse 2s ease-in-out infinite}
+.sess-chip .sess-dot.error{background:var(--danger)}
+.sess-chip .sess-loops{color:var(--accent);font-size:9px;font-weight:600;background:rgba(255,92,92,.1);padding:1px 5px;border-radius:8px}
+.sess-chip .sess-continue{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--accent);color:#fff;font-size:9px;cursor:pointer;flex-shrink:0;margin-left:2px;transition:transform .15s}
+.sess-chip .sess-continue:hover{transform:scale(1.2)}
+.sess-chip .sess-del{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;color:var(--muted);font-size:10px;cursor:pointer;flex-shrink:0;margin-left:1px;transition:all .15s;opacity:0}
+.sess-chip:hover .sess-del{opacity:1}
+.sess-chip .sess-del:hover{color:#fff;background:var(--danger)}
+.task-chip{display:flex;align-items:center;gap:5px;padding:4px 10px;border-radius:var(--radius-sm);background:var(--bg-hover);cursor:pointer;font-size:11px;transition:all .15s;border:1px solid transparent;max-width:200px}
+.task-chip:hover{background:var(--bg-elevated);border-color:var(--border-strong)}
+.task-chip-active{border-color:var(--accent);background:var(--accent-subtle)}
+.task-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--muted)}
+.task-dot-run{background:var(--ok);box-shadow:0 0 6px rgba(34,197,94,.4);animation:pulse 2s ease-in-out infinite}
+.task-chip-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.task-chip-round{font-size:10px;color:var(--muted);flex-shrink:0}
+.sess-new-btn{padding:4px 10px;background:var(--accent);border:none;border-radius:20px;font-size:11px;font-weight:600;color:#fff;cursor:pointer;white-space:nowrap;flex-shrink:0;transition:all .15s;font-family:var(--font)}
+.sess-new-btn:hover{background:var(--accent-hover);transform:translateY(-1px)}
+.sess-empty{color:var(--muted);font-size:11px;padding:0 4px;white-space:nowrap}
 """
 
 
@@ -219,37 +507,51 @@ def _esc(t: str) -> str:
             .replace('"', "&quot;").replace("'", "&#39;").replace("\n", "<br>"))
 
 
-def render_brain_entries():
-    if not brain_log:
+def render_brain_entries(log_list=None):
+    bl = log_list if log_list is not None else []
+    if not bl:
         return '<div class="empty"><div class="empty-icon">&#x1F9E0;</div><div class="empty-text">AI 大脑等待启动</div><div class="empty-hint">设定目标后点击「启动系统」</div></div>'
     parts = []
-    for e in reversed(brain_log[-50:]):
-        parts.append(f'<div class="entry">')
-        parts.append(f'<div class="entry-round">Round {e.get("round","?")} &mdash; Brain</div>')
+    for e in reversed(bl[-50:]):
+        ts = e.get("time", "")
+        time_str = f' <span style="color:var(--muted);font-weight:400">({ts})</span>' if ts else ""
+        is_quality = e.get("observation") == "quality_review"
+        entry_cls = 'entry quality-review' if is_quality else 'entry'
+        parts.append(f'<div class="{entry_cls}">')
+        if is_quality:
+            parts.append(f'<div class="entry-round" style="color:var(--warn)">Round {e.get("round","?")} &mdash; 质量评审{time_str}</div>')
+        else:
+            parts.append(f'<div class="entry-round">Round {e.get("round","?")} &mdash; Brain{time_str}</div>')
         if e.get("thought"):
             parts.append(f'<div class="entry-label brain">思考</div><div class="entry-text">{_esc(e["thought"])}</div>')
-        if e.get("observation"):
+        if e.get("observation") and not is_quality:
             parts.append(f'<div class="entry-label brain">观察</div><div class="entry-text">{_esc(e["observation"])}</div>')
-        if e.get("action"):
+        if is_quality and e.get("action"):
+            # 质量评审结果显示分数
+            parts.append(f'<div class="quality-score">{_esc(e["action"])}</div>')
+        elif e.get("action"):
             parts.append(f'<div class="action-box"><div class="action-label">发送给小龙虾</div><div class="action-text">{_esc(e["action"])}</div></div>')
         if e.get("update_memory"):
             parts.append(f'<div class="entry-text" style="color:var(--muted);font-style:italic">{_esc(e["update_memory"])}</div>')
-        sc = {"continue":"var(--ok)","milestone":"var(--warn)","blocked":"var(--danger)","pause":"var(--info)"}
+        sc = {"continue":"var(--ok)","milestone":"var(--warn)","blocked":"var(--danger)","pause":"var(--info)","quality_check":"var(--warn)","need_input":"var(--info)"}
         c = sc.get(e.get("status",""),"var(--muted)")
         parts.append(f'<div style="margin-top:8px;font-size:11px;color:{c};font-weight:600">[{e.get("status","?").upper()}]</div>')
         parts.append('</div>')
     return "".join(parts)
 
 
-def render_claw_entries():
-    if not claw_log:
+def render_claw_entries(log_list=None):
+    cl = log_list if log_list is not None else []
+    if not cl:
         return '<div class="empty"><div class="empty-icon">&#x1F980;</div><div class="empty-text">小龙虾待命中</div><div class="empty-hint">系统启动后将显示执行记录</div></div>'
     parts = []
-    for e in reversed(claw_log[-50:]):
+    for e in reversed(cl[-50:]):
         icon = "+" if e.get("success") else "x"
         cls = "ok" if e.get("success") else "fail"
+        ts = e.get("time", "")
+        time_str = f' <span style="color:var(--muted);font-weight:400">({ts})</span>' if ts else ""
         parts.append(f'<div class="entry claw">')
-        parts.append(f'<div class="entry-round">Round {e.get("round","?")} &mdash; OpenClaw [{icon}]</div>')
+        parts.append(f'<div class="entry-round">Round {e.get("round","?")} &mdash; OpenClaw [{icon}]{time_str}</div>')
         if e.get("instruction"):
             parts.append(f'<div class="entry-label claw">指令</div><div class="entry-text">{_esc(e["instruction"])}</div>')
         if e.get("result"):
@@ -258,9 +560,17 @@ def render_claw_entries():
     return "".join(parts)
 
 
-def render_memory():
+# render_memory 缓存：避免每次 poll 都读文件
+_memory_cache = {"html": "", "ts": 0}
+_MEMORY_CACHE_TTL = 3.0  # 3秒缓存
+
+def render_memory(mem_file=None):
+    global _memory_cache
+    now = time.time()
+    if now - _memory_cache["ts"] < _MEMORY_CACHE_TTL:
+        return _memory_cache["html"]
     try:
-        mem = Memory(MEMORY_FILE)
+        mem = Memory(mem_file or MEMORY_FILE)
         d = mem.data
     except Exception:
         return '<div class="empty"><div class="empty-text">无法读取记忆</div></div>'
@@ -284,6 +594,175 @@ def render_memory():
         parts.append(f'<div class="mem-card"><div class="mem-title" style="color:var(--danger)">&#x274C; 失败记录</div><div class="mem-body">{"<br>".join(_esc(f) for f in fl[-5:])}</div></div>')
     if not ms and not sp and not fl:
         parts.append('<div class="empty" style="padding:30px"><div class="empty-text">白板是空的</div></div>')
+    html = "".join(parts)
+    _memory_cache.update({"html": html, "ts": time.time()})
+    return html
+
+
+def render_outputs():
+    """渲染产物列表（支持图片/媒体/网站内联展示）"""
+    outputs = output_manager.get_recent_outputs(20)
+    # 扫描孤儿文件（在 outputs/ 但未被 manifest 引用）
+    orphan_files = output_manager.get_orphan_files()
+
+    if not outputs and not orphan_files:
+        return '<div class="empty"><div class="empty-icon">&#x1F4E6;</div><div class="empty-text">暂无产物</div><div class="empty-hint">系统执行任务后，产物会显示在这里</div></div>'
+
+    parts = []
+
+    # ---- 渲染 manifest 中的产物 ----
+    for out in outputs:
+        type_icons = {
+            "code": "&#x1F4BB;", "document": "&#x1F4C4;",
+            "image": "&#x1F5BC;", "media": "&#x1F3AC;",
+            "data": "&#x1F4CA;", "tool": "&#x1F527;", "website": "&#x1F310;",
+        }
+        icon = type_icons.get(out["type"], "&#x1F4E6;")
+        timestamp = out["timestamp"][:16].replace("T", " ")
+
+        parts.append('<div class="entry">')
+        parts.append(f'<div class="entry-round">{icon} {_esc(out["title"])} <span style="color:var(--muted);font-weight:400">({timestamp})</span></div>')
+        parts.append(f'<div class="entry-label" style="color:var(--purple-light)">{out["type"].upper()}</div>')
+
+        file_path = out.get("file_path", "")
+        fp_name = Path(file_path).name if file_path else ""
+
+        # 如果没有本地 file_path，尝试从 content 中提取 OpenClaw workspace 路径
+        ws_name = ""
+        ws_url = ""
+        if not fp_name and out["type"] in ("image", "media"):
+            import re
+            content_raw = out.get("content", "")
+            # 匹配 /workspace/xxx.png 或 /workspace/sub/xxx.png
+            m = re.search(r'/workspace/([\w\-./]+\.(?:png|jpg|jpeg|webp|gif|mp4|webp|mov|mp3|wav))', content_raw, re.IGNORECASE)
+            if m:
+                ws_name = m.group(1)
+                # 转换为 URL 路径（/workspace/sub/file.png → /openclaw-ws/sub/file.png）
+                ws_url = "/openclaw-ws/" + ws_name
+                # 检查文件是否实际存在
+                ws_disk = OPENCLAW_WS / ws_name
+                if not ws_disk.is_file():
+                    ws_url = ""
+
+        # 图片类型 - 内联展示
+        if out["type"] == "image":
+            img_src = f"/outputs/{fp_name}" if fp_name else (ws_url if ws_url else "")
+            if img_src:
+                parts.append(f'<div class="entry-img" style="margin:8px 0;cursor:pointer" onclick="showFullOutput(\'{out["id"]}\')">')
+                parts.append(f'<img src="{img_src}" alt="{_esc(out["title"])}" style="max-width:100%;max-height:400px;border-radius:8px;border:1px solid var(--border)" loading="lazy">')
+                parts.append('</div>')
+                parts.append('<div style="font-size:11px;color:var(--muted);margin-top:4px">点击查看大图</div>')
+            else:
+                # 既没有本地文件也没有 workspace 文件，显示文本
+                content = out.get("content", "")
+                if content:
+                    preview = content[:500] + ("..." if len(content) > 500 else "")
+                    parts.append(f'<div class="entry-text" style="font-size:12px;white-space:pre-wrap">{_esc(preview)}</div>')
+                parts.append('<div style="font-size:11px;color:var(--warn);margin-top:4px">原始文件未找到</div>')
+        # 媒体类型 - 内联播放
+        elif out["type"] == "media":
+            media_src = f"/outputs/{fp_name}" if fp_name else (ws_url if ws_url else "")
+            if media_src:
+                if (fp_name or ws_name or "").endswith(('.mp4', '.webm', '.mov')):
+                    parts.append(f'<div class="entry-media" style="margin:8px 0"><video src="{media_src}" controls style="max-width:100%;border-radius:8px;border:1px solid var(--border)"></video></div>')
+                else:
+                    parts.append(f'<div class="entry-media" style="margin:8px 0"><audio src="{media_src}" controls style="width:100%"></audio></div>')
+            else:
+                content = out.get("content", "")
+                if content:
+                    preview = content[:500] + ("..." if len(content) > 500 else "")
+                    parts.append(f'<div class="entry-text" style="font-size:12px;white-space:pre-wrap">{_esc(preview)}</div>')
+                parts.append('<div style="font-size:11px;color:var(--warn);margin-top:4px">原始文件未找到</div>')
+        # 网站类型 - 展示预览或链接
+        elif out["type"] == "website" and out.get("full_content"):
+            parts.append(f'<div class="entry-text" style="font-size:12px;color:var(--muted);margin-bottom:4px">HTML 页面 ({len(out["full_content"])} 字符)</div>')
+            parts.append(f'<button class="btn" style="margin-top:4px;font-size:11px;padding:6px 12px" onclick="showFullOutput(\'{out["id"]}\')">&#x1F310; 查看页面源码</button>')
+        # 代码/文档类型 - 截断预览
+        elif out["type"] in ["code", "document"]:
+            content = out.get("content", "")
+            preview = content[:300] + ("..." if len(content) > 300 else "")
+            parts.append(f'<div class="entry-text" style="font-family:var(--mono);font-size:12px;white-space:pre-wrap">{_esc(preview)}</div>')
+            if out.get("full_content"):
+                parts.append(f'<button class="btn" style="margin-top:8px;font-size:11px;padding:6px 12px" onclick="showFullOutput(\'{out["id"]}\')">查看完整内容</button>')
+        # 其他类型 - 显示文本描述
+        else:
+            content = out.get("content", "")
+            if content:
+                preview = content[:500] + ("..." if len(content) > 500 else "")
+                parts.append(f'<div class="entry-text" style="font-size:12px;white-space:pre-wrap">{_esc(preview)}</div>')
+
+        parts.append('</div>')
+
+    # ---- 渲染孤儿文件（未被 manifest 引用的产物文件）----
+    if orphan_files:
+        parts.append('<div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">')
+        parts.append('<div style="font-size:11px;color:var(--muted);margin-bottom:8px;font-weight:600">&#x1F4C1; 输出目录中的其他文件</div>')
+        for f in orphan_files[:10]:
+            ftime = f["mtime"][:16].replace("T", " ")
+            fsize = f["size"] / 1024
+            size_str = f"{fsize:.0f} KB" if fsize < 1024 else f"{fsize/1024:.1f} MB"
+            icon = "&#x1F5BC;" if f["type"] == "image" else "&#x1F3AC;"
+            if f["type"] == "image":
+                parts.append(f'<div class="entry" style="padding:10px">')
+                parts.append(f'<div style="font-size:12px;margin-bottom:6px">{icon} {_esc(f["name"])} <span style="color:var(--muted)">({size_str}, {ftime})</span></div>')
+                parts.append(f'<img src="/outputs/{f["name"]}" style="max-width:100%;max-height:400px;border-radius:8px;border:1px solid var(--border);cursor:pointer" loading="lazy">')
+                parts.append('</div>')
+            else:
+                parts.append(f'<div class="entry" style="padding:10px">')
+                parts.append(f'<div style="font-size:12px">{icon} {_esc(f["name"])} <span style="color:var(--muted)">({size_str}, {ftime})</span></div>')
+                if f["name"].endswith('.mp4') or f["name"].endswith('.webm'):
+                    parts.append(f'<video src="/outputs/{f["name"]}" controls style="max-width:100%;border-radius:8px;margin-top:6px"></video>')
+                else:
+                    parts.append(f'<audio src="/outputs/{f["name"]}" controls style="width:100%;margin-top:6px"></audio>')
+                parts.append('</div>')
+        parts.append('</div>')
+
+    return "".join(parts)
+
+
+def render_tasks():
+    """渲染任务列表"""
+    tm = get_task_manager()
+    tasks = tm.list_tasks(limit=10)
+    
+    if not tasks:
+        return '<div class="task-empty">暂无任务，点击下方创建</div>'
+    
+    parts = []
+    for task in tasks:
+        status_class = task["status"]
+        status_labels = {
+            "pending": "待执行",
+            "running": "执行中",
+            "completed": "已完成",
+            "failed": "失败"
+        }
+        status_label = status_labels.get(status_class, task["status"])
+        
+        # 任务图标
+        mode_icons = {
+            "money": "&#x1F4B0;",
+            "dev": "&#x1F6E0;",
+            "content": "&#x270F;",
+            "research": "&#x1F50D;"
+        }
+        icon = mode_icons.get(task.get("mode", "money"), "&#x1F4CB;")
+        
+        parts.append(f'<div class="task-item" data-id="{task["id"]}" onclick="taskEdit(\'{task["id"]}\')">')
+        parts.append(f'<div class="task-info">')
+        parts.append(f'<span class="task-icon">{icon}</span>')
+        parts.append(f'<div class="task-name">{_esc(task["name"])}</div>')
+        parts.append(f'</div>')
+        parts.append(f'<span class="task-status {status_class}">{status_label}</span>')
+        parts.append(f'<div class="task-actions">')
+        
+        if task["status"] == "pending":
+            parts.append(f'<button class="task-btn run" onclick="event.stopPropagation();taskRun(\'{task["id"]}\')">启动</button>')
+        
+        parts.append(f'<button class="task-btn del" onclick="event.stopPropagation();taskDelete(\'{task["id"]}\',\'{_esc(task["name"])}\')">删除</button>')
+        parts.append(f'</div>')
+        parts.append(f'</div>')
+    
     return "".join(parts)
 
 
@@ -292,7 +771,7 @@ def build_html():
 
     # Script 部分单独构建，避免 f-string 与 JS 花括号冲突
     js_script = """<script>
-let running=false,timer=null;
+let running=false,timer=null,pollOnce=false;
 const $=id=>document.getElementById(id);
 
 /* === 对话框 === */
@@ -317,12 +796,59 @@ function renderChatMsgs(msgs){
 function sendChat(){
   var inp=$('chat-input'),txt=inp.value.trim();
   if(!txt)return;
-  inp.value='';
-  fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({answer:txt})})
+  var msg=txt;inp.value='';
+  // 先在本地显示用户消息
+  var body=$('chat-body');
+  var userDiv=document.createElement('div');
+  userDiv.className='chat-msg usr';
+  userDiv.innerHTML='<div class="chat-msg-label">你</div><div>'+msg.replace(/</g,'&lt;')+'</div>';
+  body.appendChild(userDiv);
+  body.scrollTop=body.scrollHeight;
+
+  fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,task_id:currentTaskId})})
   .then(function(r){return r.json()})
   .then(function(d){
-    $('chat-body').innerHTML=renderChatMsgs(d.messages);
-    var b=$('chat-body');if(b)b.scrollTop=b.scrollHeight;
+    if(d.error && d.type!=='resumed'){
+      var hint=document.createElement('div');
+      hint.className='chat-msg sys';
+      hint.style.color='var(--warn)';
+      hint.innerHTML='<div class="chat-msg-label">系统</div><div>'+d.error+'</div>';
+      body.appendChild(hint);
+    } else if(d.type==='resumed'){
+      var hint=document.createElement('div');
+      hint.className='chat-msg sys';
+      hint.innerHTML='<div class="chat-msg-label">系统</div><div>已恢复运行，正在处理你的指示...</div>';
+      body.appendChild(hint);
+      // 更新 UI 为运行中
+      running=true;
+      $('gobtn').className='btn btn-stop';
+      $('gobtn').innerHTML='暂停';
+      $('s-dot').className='dot dot-run';
+      $('s-text').textContent='运行中（已恢复）';
+      if(!timer){timer=setTimeout(poll,2000);}
+    } else if(d.quick_action){
+      var hint=document.createElement('div');
+      hint.className='chat-msg sys';
+      hint.innerHTML='<div class="chat-msg-label">系统</div><div>已执行: '+d.quick_action+'</div>';
+      body.appendChild(hint);
+    } else if(d.messages && d.messages.length>0){
+      // 显示系统回复（最后一条）
+      var last=d.messages[d.messages.length-1];
+      if(last && last.role==='sys'){
+        var hint=document.createElement('div');
+        hint.className='chat-msg sys';
+        hint.innerHTML='<div class="chat-msg-label">系统</div><div>'+last.text+'</div>';
+        body.appendChild(hint);
+      }
+    }
+    body.scrollTop=body.scrollHeight;
+  }).catch(function(e){
+    var hint=document.createElement('div');
+    hint.className='chat-msg sys';
+    hint.style.color='var(--warn)';
+    hint.innerHTML='<div class="chat-msg-label">系统</div><div>发送失败</div>';
+    body.appendChild(hint);
+    body.scrollTop=body.scrollHeight;
   });
 }
 
@@ -336,12 +862,78 @@ function stab(t){
 
 function setg(el){
   const map={
-    '\\u83b7\\u5ba2':'\\u5206\\u6790\\u5f53\\u524d\\u83b7\\u5ba2\\u6e20\\u9053\\uff0c\\u627e\\u5230\\u8f6c\\u5316\\u7387\\u6700\\u9ad8\\u7684\\u65b9\\u5f0f\\u5e76\\u6301\\u7eed\\u653e\\u5927\\uff0c\\u76f4\\u5230\\u4ea7\\u751f\\u771f\\u5b9e\\u6536\\u5165\\u3002',
-    '\\u5b9a\\u4ef7':'\\u8c03\\u7814 Gumroad \\u4e0a\\u5356 AI prompt \\u7684\\u6700\\u4f73\\u5b9a\\u4ef7\\u7b56\\u7565\\u548c\\u7ade\\u54c1\\u5206\\u6790\\u3002',
-    'Reddit':'\\u641c\\u7d22 Reddit \\u4e0a\\u5173\\u4e8e AI automation \\u8d5a\\u94b1\\u7684\\u6700\\u65b0\\u5e16\\u5b50\\uff0c\\u603b\\u7ed3\\u6210\\u529f\\u6848\\u4f8b\\u3002'
+    'PPT':'用AI自动生成精美的商业PPT模板，研究Gumroad上同类产品的定价和卖点，制作3-5个高质量模板并上架售卖，目标是首周产生第一笔收入。',
+    'Prompt':'研究Gumroad上最畅销的AI Prompt Pack类别和定价，针对1-2个高需求场景（如SEO写作、社交媒体内容），批量生成prompt并打包上架。',
+    'Notion':'调研Gumroad上热销的Notion模板类型（个人CRM、项目管理、习惯追踪等），用AI生成3个高质量模板并上架售卖。',
+    '\\u4ee3\\u5199':'在小红书、知乎、Medium等平台接代写文章订单，用AI批量生成高质量文章，按篇收费，目标单月收入$200+。',
+    '\\u8bbe\\u8ba1':'用AI批量生成社交媒体素材包（Instagram模板、YouTube封面、Pinterest图），打包上传到Gumroad/Etsy售卖。'
   };
   const text=el.textContent;
   for(const[k,v]of Object.entries(map)){if(text.includes(k)){$('goal').value=v;return;}}
+}
+
+/* === 快速模块切换 === */
+function setMode(mode){
+  const goals={
+    'money':'你是一个全自动创业者。用你的一切能力（搜索调研、商业判断、浏览器操作、代码开发、API调用）去赚钱。第一步：搜索当前市场，找到你能力范围内的真实赚钱机会。然后自主评估、验证、执行。不要等指令，不要只调研不行动，目标是在本次运行中产生真实的收入或可交付的变现产物。遇到需要账号权限时向我要。',
+    'dev':'分析用户需求，设计并实现最优技术方案，产出可用的工具或应用。'
+  };
+  const labels={
+    'money':'\\u8D5A\\u94B1\\u6A21\\u5F0F',
+    'dev':'\\u5F00\\u53D1\\u6A21\\u5F0F'
+  };
+  if(goals[mode]){
+    $('goal').value=goals[mode];
+    document.querySelectorAll('.mode-btn').forEach(function(b){b.classList.remove('mode-active');});
+    $('mode-'+mode).classList.add('mode-active');
+  }
+}
+
+function showFullOutput(id){
+  fetch('/api/output/'+id).then(function(r){return r.json()}).then(function(d){
+    if(d.error){alert(d.error);return;}
+    var modal=document.getElementById('output-modal-bg');
+    if(!modal){
+      var bg=document.createElement('div');
+      bg.id='output-modal-bg';
+      bg.className='cred-modal-bg';
+      bg.onclick=function(e){if(e.target===bg)bg.style.display='none';};
+      document.body.appendChild(bg);
+      modal=bg;
+    }
+    var body='';
+    // 提取 OpenClaw workspace 文件路径（/workspace/xxx.png）
+    var wsMatch=d.content?d.content.match(/\\/workspace\\/([\\w\\-./]+\\.(?:png|jpg|jpeg|webp|gif|mp4|webp|mov|mp3|wav))/i):null;
+    var wsSrc=wsMatch?'/openclaw-ws/'+wsMatch[1]:'';
+    if(d.type==='image'&&d.file_path){
+      // 图片类型 - 大图展示（本地文件）
+      var fname=d.file_path.split('/').pop().split(String.fromCharCode(92)).pop();
+      body='<div style="text-align:center"><img src="/outputs/'+fname+'" style="max-width:90vw;max-height:75vh;border-radius:8px" onclick="window.open(this.src)"></div>';
+    }else if(d.type==='image'&&wsSrc){
+      // 图片类型 - OpenClaw workspace 文件
+      body='<div style="text-align:center"><img src="'+wsSrc+'" style="max-width:90vw;max-height:75vh;border-radius:8px" onclick="window.open(this.src)"></div>';
+    }else if(d.type==='media'&&d.file_path){
+      var fname=d.file_path.split('/').pop().split(String.fromCharCode(92)).pop();
+      if(fname.match(/\\.(mp4|webm|mov)/)){
+        body='<video src="/outputs/'+fname+'" controls style="max-width:90vw;max-height:75vh"></video>';
+      }else{
+        body='<audio src="/outputs/'+fname+'" controls style="width:90vw"></audio>';
+      }
+    }else if(d.type==='media'&&wsSrc){
+      if(wsSrc.match(/\\.(mp4|webm|mov)/)){
+        body='<video src="'+wsSrc+'" controls style="max-width:90vw;max-height:75vh"></video>';
+      }else{
+        body='<audio src="'+wsSrc+'" controls style="width:90vw"></audio>';
+      }
+    }else if(d.type==='website'&&d.content){
+      // 网站类型 - HTML 预览
+      body='<iframe srcdoc="'+d.content.replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'" style="width:100%;height:60vh;border:none;border-radius:8px;background:white"></iframe>';
+    }else{
+      body='<pre style="white-space:pre-wrap;font-family:var(--mono);font-size:12px;line-height:1.5">'+d.content.replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre>';
+    }
+    modal.innerHTML='<div class="cred-modal" style="max-width:900px;max-height:85vh;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h3>'+d.title+'</h3><span style="color:var(--muted);font-size:12px;cursor:pointer" onclick="this.closest(\\x27.cred-modal\\x27).parentElement.style.display=\\x27none\\x27">关闭</span></div>'+body+'</div>';
+    modal.style.display='flex';
+  });
 }
 
 function toggle(){
@@ -354,39 +946,197 @@ function toggle(){
     $('gobtn').disabled=true;
     $('gobtn').innerHTML='<span class="spinner"></span>启动中...';
 
+    // 不清空面板——继续任务时保留历史，新数据由 poll 刷新
+    currentViewSid=null;
+
+    // 构建请求体，如果有 continueFromSid 就带上
+    var reqBody={goal:goal,agent:agent,max_loops:maxl,loop_interval:ival};
+    if(continueFromSid){reqBody.continue_from=continueFromSid;}
+
     fetch('/api/start',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({goal:goal,agent:agent,max_loops:maxl,loop_interval:ival})
+      body:JSON.stringify(reqBody)
     })
     .then(function(r){
       if(!r.ok) return r.json().then(function(d){throw new Error(d.error||'HTTP '+r.status)});
       return r.json();
     })
     .then(function(d){
-      if(d.error){showError(d.error);$('gobtn').disabled=false;$('gobtn').innerHTML='启动系统';return;}
+      if(d.error){showError(d.error);$('gobtn').disabled=false;$('gobtn').innerHTML='启动新任务';return;}
       running=true;
+      currentTaskId=d.task_id;
+      // 启动成功后清除 continueFromSid（避免下次启动误续接）
+      continueFromSid=null;
       $('gobtn').className='btn btn-stop';
-      $('gobtn').innerHTML='停止系统';
+      $('gobtn').innerHTML='停止当前任务';
       $('gobtn').disabled=false;
       $('s-dot').className='dot dot-g';
       $('s-text').textContent='系统运行中';
       $('c-agent').textContent=agent;
-      timer=setInterval(poll,2000);
+      if(!timer) timer=setTimeout(poll,2000);
+      poll();
     })
     .catch(function(e){
       showError('启动失败: '+e.message);
-      $('gobtn').disabled=false;$('gobtn').innerHTML='启动系统';
+      $('gobtn').disabled=false;$('gobtn').innerHTML='启动新任务';
     });
   } else {
-    fetch('/api/stop',{method:'POST'}).then(function(){
+    // 停止当前活跃任务
+    fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:currentTaskId||''})}).then(function(){
       running=false;
-      $('gobtn').className='btn btn-go';
-      $('gobtn').innerHTML='启动系统';
+      // 不改变按钮文字——保持"继续执行"或"启动新任务"由 poll() 决定
       $('s-dot').className='dot dot-x';
-      clearInterval(timer);timer=null;
+      clearTimeout(timer);timer=null;
+      // 最后一次 poll 获取最终状态（包括设置 continueFromSid）
+      pollOnce=true;
       poll();
     });
   }
+}
+
+/* === 会话管理 === */
+var currentViewSid=null; // null = 当前活跃会话，字符串 = 查看历史会话
+var continueFromSid=null; // 记住从哪个会话继续，启动时传给后端
+
+function loadSessions(){
+  fetch('/api/sessions').then(function(r){return r.json()}).then(function(d){
+    var bar=$('sess-bar');
+    // 结构：<button 新建> | <div 可滚动会话列表>
+    var newBtn='<button class="sess-new-btn" onclick="newSession()">+ 新建</button>';
+    if(!d.sessions||d.sessions.length===0){
+      bar.innerHTML=newBtn+'<div class="sess-empty" style="margin-left:4px">暂无历史任务</div>';
+      return;
+    }
+    var h='<div class="sess-sessions">';
+    // 按时间倒序展示（index 已经是倒序的）
+    for(var i=0;i<d.sessions.length;i++){
+      var s=d.sessions[i];
+      var short=s.goal.length>15?s.goal.slice(0,15)+'...':s.goal;
+      var time=s.start_time?s.start_time.slice(11,16):'';
+      var isActive=(s.status==='running');
+      var dotCls=s.status==='running'?'running':s.status==='error'?'error':'stopped';
+      var actCls=isActive&&!currentViewSid?' active':(currentViewSid===s.id?' active':'');
+      var loops=s.loop_count||0;
+      var isResumable=(!isActive && s.goal && !s.goal.startsWith('(新建'));
+      var contBtn=isResumable?`<span class="sess-continue" onclick="event.stopPropagation();continueSession('${s.id}')" title="继续此任务">&#9654;</span>`:'';
+      var delBtn=`<span class="sess-del" onclick="event.stopPropagation();deleteSession('${s.id}','${escH(short)}')" title="删除">&#10005;</span>`;
+      h+=`<span class="sess-chip${actCls}" data-sid="${s.id}" onclick="viewSession('${s.id}')">`;      h+='<span class="sess-dot '+dotCls+'"></span>';
+      h+='<span>'+escH(short)+'</span>';
+      h+='<span class="sess-time">'+time+'</span>';
+      if(loops>0) h+='<span class="sess-loops">R'+loops+'</span>';
+      h+=contBtn;
+      h+=delBtn;
+      h+='</span>';
+    }
+    h+='</div>';
+    // 保持滚动位置不变
+    var scrollWrap=bar.querySelector('.sess-sessions');
+    var savedScroll=scrollWrap?scrollWrap.scrollLeft:0;
+    bar.innerHTML=newBtn+h;
+    var newWrap=bar.querySelector('.sess-sessions');
+    if(newWrap&&savedScroll) newWrap.scrollLeft=savedScroll;
+  }).catch(function(e){console.error('loadSessions error:',e);});
+}
+
+function viewSession(sid){
+  if(sid===currentViewSid){
+    // 退出历史查看，恢复当前运行视图
+    currentViewSid=null;
+    poll();
+    if(running&&!timer)timer=setTimeout(poll,2000);
+    loadSessions();
+    return;
+  }
+  currentViewSid=sid;
+  // 停止 poll（查看历史）
+  if(timer){clearTimeout(timer);timer=null;}
+  fetch('/api/sessions/'+sid).then(function(r){return r.json()}).then(function(d){
+    if(d.error){showError(d.error);return;}
+    stab('brain');  // 切到 AI大脑 面板
+    $('brain-body').innerHTML=d.brain;
+    $('claw-body').innerHTML=d.claw;
+    $('r-badge').textContent='Round '+d.loop_count;
+    $('s-text').textContent=d.status==='running'?'运行中（历史）':'已停止';
+    var ob=$('out-body');ob.innerHTML='<div class="empty"></div>';
+    var link=document.createElement('a');link.href='javascript:void(0)';link.textContent='点击此处或再次点击该会话返回当前任务';link.style.color='var(--accent)';link.style.cursor='pointer';link.onclick=function(){viewSession(sid);};
+    ob.firstChild.className='empty';ob.firstChild.appendChild(link);
+    loadSessions();
+  });
+}
+
+function continueSession(sid){
+  fetch('/api/sessions/'+sid+'/continue').then(function(r){return r.json()}).then(function(d){
+    if(d.error){showError(d.error);return;}
+    // 切回当前会话视图（退出历史查看模式）
+    currentViewSid=null;
+    // 记住从哪个会话继续，启动时传给后端
+    continueFromSid=sid;
+    // 保留历史记录显示，而不是清空
+    if(d.brain && d.brain.indexOf('AI 大脑等待启动')===-1){ $('brain-body').innerHTML=d.brain; }
+    else { $('brain-body').innerHTML='<div class="empty"><div class="empty-icon">&#x1F9E0;</div><div class="empty-text">AI 大脑等待启动</div></div>'; }
+    if(d.claw && d.claw.indexOf('小龙虾待命中')===-1){ $('claw-body').innerHTML=d.claw; }
+    else { $('claw-body').innerHTML='<div class="empty"><div class="empty-icon">&#x1F980;</div><div class="empty-text">小龙虾待命中</div></div>'; }
+    $('out-body').innerHTML='';
+    var lc=d.loop_count||0;
+    $('r-badge').textContent='Round '+lc;
+    $('s-dot').className='dot dot-x';
+    $('s-text').textContent='已加载上下文（Round '+lc+'）';
+    running=false;
+    $('gobtn').className='btn btn-go';
+    $('gobtn').innerHTML=lc>0?'继续执行':'启动新任务';
+    $('gobtn').disabled=false;
+    if(timer){clearTimeout(timer);timer=null;}
+    // 只填入原始目标，不拼接上下文
+    $('goal').value=d.goal;
+    $('goal').focus();
+    $('goal').blur();
+    loadSessions();
+    showNotice('已加载上次任务（已跑'+lc+'轮），点击「'+(lc>0?'继续执行':'启动新任务')+'」');
+  }).catch(function(e){showError('加载任务上下文失败: '+e.message);});
+}
+
+function deleteSession(sid,name){
+  if(!confirm('确定删除任务「'+name+'」？'))return;
+  fetch('/api/sessions/'+sid,{method:'DELETE'}).then(function(r){return r.json()}).then(function(d){
+    if(d.error){showError(d.error);return;}
+    if(currentViewSid===sid){currentViewSid=null;poll();}
+    loadSessions();
+    showNotice('已删除');
+  }).catch(function(e){showError('删除失败: '+e.message);});
+}
+
+function showNotice(msg){
+  var el=document.createElement('div');
+  el.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(16,185,129,0.95);color:#fff;padding:12px 24px;border-radius:10px;font-size:13px;z-index:9999;max-width:500px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.4)';
+  el.textContent=msg;
+  document.body.appendChild(el);
+  setTimeout(function(){el.style.opacity='0';el.style.transition='opacity 0.5s';setTimeout(function(){el.remove()},600)},4000);
+}
+
+function newSession(){
+  currentViewSid=null;
+  continueFromSid=null;  // 新建任务不再续接
+  currentTaskId='';
+  fetch('/api/sessions/new',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+    if(d.error){showError(d.error);return;}
+    // 清空右侧
+    $('brain-body').innerHTML='<div class="empty"><div class="empty-icon">&#x1F9E0;</div><div class="empty-text">AI 大脑等待启动</div><div class="empty-hint">设定目标后点击「启动系统」</div></div>';
+    $('claw-body').innerHTML='<div class="empty"><div class="empty-icon">&#x1F980;</div><div class="empty-text">小龙虾待命中</div><div class="empty-hint">系统启动后将显示执行记录</div></div>';
+    $('out-body').innerHTML='';
+    $('mem-body').innerHTML='';
+    $('r-badge').textContent='Round 0';
+    $('c-badge').textContent='0 次执行';
+    $('out-badge').textContent='0 个产物';
+    $('s-dot').className='dot dot-x';
+    $('s-text').textContent='待命中';
+    running=false;
+    $('gobtn').className='btn btn-go';
+    $('gobtn').innerHTML='启动新任务';
+    $('gobtn').disabled=false;
+    if(timer){clearTimeout(timer);timer=null;}
+    $('goal').value='';
+    loadSessions();
+  }).catch(function(e){showError('新建任务失败: '+e.message);});
 }
 
 function showError(msg){
@@ -397,52 +1147,417 @@ function showError(msg){
   setTimeout(function(){el.style.opacity='0';el.style.transition='opacity 0.5s';setTimeout(function(){el.remove()},600)},5000);
 }
 
+var currentTaskId='';
+
 function poll(){
-  fetch('/api/state').then(function(r){return r.json()}).then(function(d){
-    $('brain-body').innerHTML=d.brain;
-    $('claw-body').innerHTML=d.claw;
-    $('mem-body').innerHTML=d.memory;
-    $('s-text').textContent=d.status;
-    $('r-badge').textContent='Round '+d.round;
-    $('c-badge').textContent=d.claw_count+' 次执行';
-    /* 对话框 */
-    $('chat-body').innerHTML=renderChatMsgs(d.chat_messages);
-    if(d.has_question){
+  if(!running && !pollOnce){return;}
+  pollOnce=false;
+  var url='/api/state';
+  if(currentTaskId) url+='?task_id='+encodeURIComponent(currentTaskId);
+  // AbortController 超时：5秒无响应自动取消，防止连接堆积
+  var ctrl=new AbortController();
+  var fetchTimer=setTimeout(function(){ctrl.abort();},5000);
+  fetch(url,{signal:ctrl.signal}).then(function(r){clearTimeout(fetchTimer);return r.json()}).then(function(d){
+    // === 初始化阶段的按钮状态设置（页面刷新后 running=false，需要主动判断） ===
+    // 注意：只有非运行状态才执行，running=true 时的按钮由 toggle() 的 .then() 设置
+    var isRunning = d.tasks && d.tasks.length > 0 && d.tasks[0].running;
+    if(!isRunning && !running){
+      // 页面刷新后（running=false 且 Worker 未启动）→ 主动设置按钮状态
+      var hasHistory = d.round > 0 && d.task_id;
+      var btnText = hasHistory ? '继续执行' : '启动新任务';
+      var statusText = hasHistory ? '已停止（Round '+d.round+'）' : '待命中';
+      $('gobtn').className='btn btn-go';
+      $('gobtn').innerHTML=btnText;
+      $('s-dot').className='dot dot-x';
+      $('s-text').textContent=statusText;
+      if(hasHistory){continueFromSid=d.session_id;}
+    }
+
+    // 在替换内容前，保存各面板距底部的距离
+    var bb=$('brain-body'),cb=$('claw-body');
+    var bbDist=bb?(bb.scrollHeight-bb.scrollTop-bb.clientHeight):0;
+    var cbDist=cb?(cb.scrollHeight-cb.scrollTop-cb.clientHeight):0;
+
+    // 只在有实际内容时更新面板（防止空响应覆盖已有历史）
+    if(d.task_id || (d.brain && d.brain.indexOf('AI 大脑等待启动')===-1)){
+      $('brain-body').innerHTML=d.brain;
+    }
+    if(d.task_id || (d.claw && d.claw.indexOf('小龙虾待命中')===-1)){
+      $('claw-body').innerHTML=d.claw;
+    }
+    // 只在有活跃任务时才覆盖对话和记忆面板（防止后端重启后清空）
+    if(d.task_id){
+      $('mem-body').innerHTML=d.memory;
+      $('out-body').innerHTML=d.outputs;
+      $('chat-body').innerHTML=renderChatMsgs(d.chat_messages);
+    }
+    // 只在有活跃任务时更新状态文字和计数（防止后端重启后覆盖为"待命中"）
+    if(d.task_id){
+      $('s-text').textContent=d.status;
+      $('r-badge').textContent='Round '+d.round;
+      $('c-badge').textContent=d.claw_count+' 次执行';
+      $('out-badge').textContent=d.output_count+' 个产物';
+    }
+    currentTaskId=d.task_id||currentTaskId;
+
+    // 对话框
+    // 只在有活跃任务时更新对话框状态
+    if(d.task_id && d.has_question){
       $('chat-fab-badge').classList.add('show');
       $('chat-fab-badge').textContent=d.chat_messages.length;
       if(!chatOpen)toggleChat();
-    }else{
+    }else if(d.task_id){
       $('chat-fab-badge').classList.remove('show');
     }
-    if(d.status.indexOf('停止')>=0||d.status.indexOf('待命')>=0){
+
+    // 更新任务栏
+    renderTaskBar(d.tasks||[]);
+
+    // 判断当前任务是否还在运行
+    var activeTaskRunning=false;
+    if(d.tasks){for(var i=0;i<d.tasks.length;i++){if(d.tasks[i].task_id===currentTaskId&&d.tasks[i].running){activeTaskRunning=true;break;}}}
+
+    if(!activeTaskRunning){
       if(running){
         running=false;
+        // 判断是"跑完自动停"还是"手动停止"
+        // 如果有当前任务且有轮数记录，说明是跑完了，显示"继续执行"
+        var hasCompletedTask = d.round > 0 && currentTaskId;
         $('gobtn').className='btn btn-go';
-        $('gobtn').innerHTML='启动系统';
+        $('gobtn').innerHTML = hasCompletedTask ? '继续执行' : '启动新任务';
         $('s-dot').className='dot dot-x';
-        clearInterval(timer);timer=null;
+        $('s-text').textContent = hasCompletedTask ? '已停止（Round '+d.round+'）' : '待命中';
+        // 任务完成时记住 session_id，这样点"继续执行"能续接
+        if(hasCompletedTask && d.session_id){
+          continueFromSid = d.session_id;
+        }
+        // 如果没有运行中的任务了，停止轮询
+        var anyRunning=false;
+        if(d.tasks){for(var i=0;i<d.tasks.length;i++){if(d.tasks[i].running){anyRunning=true;break;}}}
+        if(!anyRunning){clearTimeout(timer);timer=null;}
+        // 任务完成时刷新会话列表，让继续按钮出现
+        loadSessions();
       }
+    } else {
+      running=true;
+      $('gobtn').className='btn btn-stop';
+      $('gobtn').innerHTML='停止当前任务';
     }
+
     if(d.status.indexOf('思考')>=0){$('s-dot').className='dot dot-y';$('s-text').textContent=d.status;}
     else if(d.status.indexOf('运行')>=0){$('s-dot').className='dot dot-g';}
-    var bb=$('brain-body'),cb=$('claw-body');
-    if(bb.lastChild)bb.scrollTop=bb.scrollHeight;
-    if(cb.lastChild)cb.scrollTop=cb.scrollHeight;
+    // 智能滚动：如果用户之前在底部附近，自动滚到底；否则保持原位
+    if(bb && bbDist<100){bb.scrollTop=bb.scrollHeight;}
+    if(cb && cbDist<100){cb.scrollTop=cb.scrollHeight;}
+    // 更新会话列表（仅运行时）
+    if(running){loadSessions();}
+    // 递归调度下一次 poll（上一次完成后等 2 秒，避免请求堆积）
+    if(running){timer=setTimeout(poll,2000);}
+  }).catch(function(e){
+    // fetch 超时或网络错误：静默忽略，等 2 秒后重试
+    if(timer){clearTimeout(timer);}
+    if(running){timer=setTimeout(poll,2000);}
   });
 }
 
+function renderTaskBar(tasks){
+  var el=$('task-bar');
+  if(!el)return;
+  if(!tasks||tasks.length===0){el.innerHTML='';el.style.display='none';return;}
+  el.style.display='flex';
+  var h='';
+  for(var i=0;i<tasks.length;i++){
+    var t=tasks[i];
+    var cls='task-chip'+(t.task_id===currentTaskId?' task-chip-active':'');
+    var dot='<span class="task-dot'+(t.running?' task-dot-run':'')+'"></span>';
+    h+=`<div class="${cls}" onclick="switchTask('${t.task_id}')" title="${escH(t.goal)}">`;
+    h+=dot+'<span class="task-chip-text">'+escH(t.goal.substring(0,25))+(t.goal.length>25?'...':'')+'</span>';
+    h+='<span class="task-chip-round">R'+t.round+'</span>';
+    h+='</div>';
+  }
+  el.innerHTML=h;
+}
+
+function switchTask(taskId){
+  currentTaskId=taskId;
+  // 清空面板避免闪烁
+  $('brain-body').innerHTML='<div class="empty"><div class="empty-text">切换中...</div></div>';
+  $('claw-body').innerHTML='';
+  pollOnce=true;
+  poll();
+}
+
+// 初始加载会话列表
+setTimeout(loadSessions,800);
+
+// 初始 poll：检查是否有运行中的任务（如果 Worker 在跑，会被 poll 接管）
+pollOnce=true;
 poll();
+
+// ========== 凭据管理 ==========
+var credTemplates={};
+var credEditingId=null;
+
+function credLoad(){
+  fetch('/api/credentials').then(function(r){return r.json()}).then(function(d){
+    var el=$('cred-list');
+    if(!d.accounts||d.accounts.length===0){el.innerHTML='<div class="cred-empty">暂无账号，点击下方添加</div>';return;}
+    var h='';
+    for(var i=0;i<d.accounts.length;i++){
+      var a=d.accounts[i];
+      var tpl=credTemplates[a.category]||{label:a.category,icon:'🔧'};
+      h+='<div class="cred-item" data-id="'+a.id+'" onclick="credEdit(this.dataset.id)">';
+      h+='<div class="cred-info"><span class="cred-icon">'+tpl.icon+'</span><div><div class="cred-name">'+escH(a.name)+'</div><div class="cred-cat">'+escH(tpl.label)+'</div></div></div>';
+      h+='<div class="cred-actions"><button class="cred-btn del" data-id="'+a.id+'" data-name="'+escH(a.name)+'" onclick="event.stopPropagation();credDel(this.dataset.id,this.dataset.name)">删除</button></div>';
+      h+='</div>';
+    }
+    el.innerHTML=h;
+  });
+}
+
+function credLoadTemplates(){
+  fetch('/api/credentials/templates').then(function(r){return r.json()}).then(function(d){
+    credTemplates=d.templates;
+    window._credPresets=d.presets||[];
+  });
+}
+
+function credOpenModal(editId){
+  credEditingId=editId||null;
+  var modal=document.getElementById('cred-modal-bg');
+  if(!modal){
+    var bg=document.createElement('div');
+    bg.id='cred-modal-bg';
+    bg.className='cred-modal-bg';
+    bg.onclick=function(e){if(e.target===bg)credCloseModal();};
+    bg.innerHTML='<div class="cred-modal" id="cred-modal"></div>';
+    document.body.appendChild(bg);
+    modal=bg;
+  }else{
+    modal.style.display='flex';
+  }
+  var m=document.getElementById('cred-modal');
+  if(editId){
+    m.innerHTML='<h3>编辑账号</h3>';
+    fetch('/api/credentials/'+editId).then(function(r){return r.json()}).then(function(a){
+      if(a.error){credCloseModal();return;}
+      credRenderForm(m,a);
+    });
+  }else{
+    m.innerHTML='<h3>添加账号</h3>';
+    credRenderForm(m,null);
+  }
+  modal.style.display='flex';
+}
+
+function credRenderForm(container,account){
+  var name=account?account.name:'';
+  var cat=account?account.category:'';
+  var fields=account?account.fields:[];
+
+  var h='<div class="cred-field"><label>账号名称</label><input id="cred-name" placeholder="如: 我的DeepSeek" value="'+escH(name)+'"></div>';
+  h+='<div style="font-size:11px;color:var(--muted);margin-bottom:10px">选择类型，自动填入对应字段</div>';
+  h+='<div id="cred-cat-btns" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px"></div>';
+  h+='<div class="cred-field"><label>账号信息</label><div class="cred-dynamic-fields" id="cred-fields"></div></div>';
+  h+='<div class="cred-modal-btns"><button class="cred-btn-cancel" onclick="credCloseModal()">取消</button><button class="cred-btn-save" onclick="credSave()">保存</button></div>';
+  container.innerHTML='<h3>'+(credEditingId?'编辑账号':'添加账号')+'</h3>'+h;
+
+  window._credFields=JSON.parse(JSON.stringify(fields));
+  window._credCat=cat;
+  credRenderCatBtns();
+  credRenderFields();
+}
+
+function credRenderCatBtns(){
+  var el=document.getElementById('cred-cat-btns');
+  if(!el)return;
+  var cats=['ai_api','payment','social_media','dev_platform','custom'];
+  var h='';
+  for(var i=0;i<cats.length;i++){
+    var c=cats[i];
+    var t=credTemplates[c]||{label:c,icon:'🔧'};
+    var active=window._credCat===c?' style="border-color:var(--accent);color:var(--accent)"':'';
+    h+='<button type="button" class="cred-btn" data-cat="'+c+'" onclick="credPickCat(this.dataset.cat)"'+active+'>'+t.icon+' '+t.label+'</button>';
+  }
+  el.innerHTML=h;
+}
+
+function credPickCat(c){
+  window._credCat=c;
+  var tpl=credTemplates[c];
+  if(tpl){window._credFields=JSON.parse(JSON.stringify(tpl.fields));}
+  credRenderCatBtns();
+  credRenderFields();
+}
+
+function credRenderFields(){
+  var el=document.getElementById('cred-fields');
+  if(!el)return;
+  if(!window._credFields.length){
+    el.innerHTML='<div style="font-size:11px;color:var(--muted);text-align:center;padding:12px">先选择一个类型，或点击下方添加</div><div style="text-align:center"><button type="button" class="cred-btn" onclick="window._credFields=[{key:\"account\",label:\"账号\",value:\"\",type:\"text\"},{key:\"password\",label:\"密码\",value:\"\",type:\"password\"}];credRenderFields();">+ 手动添加</button></div>';
+    return;
+  }
+  var h='';
+  for(var i=0;i<window._credFields.length;i++){
+    var f=window._credFields[i];
+    var lbl=f.label||f.key||'';
+    var val=f.value||'';
+    var tp=f.type==='password'?'password':'text';
+    h+='<div class="cred-field-row" style="margin-bottom:8px">';
+    h+='<span style="min-width:90px;font-size:12px;color:var(--muted);padding:8px 0;flex-shrink:0">'+escH(lbl)+'</span>';
+    h+='<input type="'+tp+'" placeholder="输入'+escH(lbl)+'" value="'+escH(val)+'" data-fidx="'+i+'" data-fkey="value" oninput="credFieldUpdate(+this.dataset.fidx,this.dataset.fkey,this.value)" style="flex:1">';
+    h+='<button onclick="credRemoveField('+i+')" style="background:0 0;border:none;color:var(--muted);cursor:pointer;font-size:16px;padding:4px 8px;flex-shrink:0">×</button>';
+    h+='</div>';
+  }
+  h+='<div style="text-align:center;margin-top:4px"><button type="button" class="cred-btn" onclick="credShowAddMenu()">+ 添加字段</button></div>';
+  el.innerHTML=h;
+}
+
+function credShowAddMenu(){
+  var presets=window._credPresets||[];
+  var h='<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;padding:8px 0">';
+  for(var i=0;i<presets.length;i++){
+    var p=presets[i];
+    h+='<button type="button" class="cred-btn" data-pkey="'+escH(p.key)+'" data-plabel="'+escH(p.label)+'" data-ptype="'+escH(p.type)+'" onclick="credAddPreset(this.dataset)">'+escH(p.label)+'</button>';
+  }
+  h+='</div>';
+  var el=document.getElementById('cred-fields');
+  el.innerHTML+=h;
+}
+
+function credAddPreset(dataset){
+  window._credFields.push({key:dataset.pkey,label:dataset.plabel,value:'',type:dataset.ptype});
+  credRenderFields();
+}
+
+function credFieldUpdate(idx,prop,val){window._credFields[idx][prop]=val;}
+
+function credRemoveField(idx){window._credFields.splice(idx,1);credRenderFields();}
+
+function credSave(){
+  var name=$('cred-name').value.trim();
+  var cat=window._credCat||'custom';
+  var fields=window._credFields.filter(function(f){return f.key&&f.key.trim()!=='';});
+  if(!name){alert('请输入账号名称');return;}
+  if(fields.length===0){alert('请至少添加一个字段');return;}
+
+  var body=JSON.stringify({name:name,category:cat,fields:fields});
+  var url=credEditingId?'/api/credentials/'+credEditingId:'/api/credentials';
+  var method=credEditingId?'PUT':'POST';
+  fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:body}).then(function(r){return r.json()}).then(function(d){
+    if(d.error){alert(d.error);return;}
+    credCloseModal();
+    credLoad();
+  });
+}
+
+function credDel(id,name){
+  if(!confirm('确定删除账号 "'+name+'" 吗？此操作不可撤销。'))return;
+  fetch('/api/credentials/'+id,{method:'DELETE'}).then(function(){credLoad();});
+}
+
+function credCloseModal(){
+  var el=document.getElementById('cred-modal-bg');
+  if(el)el.style.display='none';
+  credEditingId=null;
+  window._credFields=[];
+}
+
+function escH(s){if(!s)return '';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+credLoadTemplates();
+setTimeout(credLoad,500);
+
+// ========== 目标管理 ==========
+function taskLoad(){
+  fetch('/api/tasks').then(function(r){return r.json()}).then(function(d){
+    var el=$('goal-tags');
+    if(!d.tasks||d.tasks.length===0){el.innerHTML='';return;}
+    var h='';
+    for(var i=0;i<d.tasks.length;i++){
+      var t=d.tasks[i];
+      var short=t.name.length>12?t.name.slice(0,12)+'...':t.name;
+      h+=`<span class="goal-tag" onclick="taskEdit('${t.id}')" title="${escH(t.name)}">${escH(short)}<span class="x" onclick="event.stopPropagation();taskDelete('${t.id}','')">x</span></span>`;
+    }
+    el.innerHTML=h;
+  }).catch(function(e){console.error('taskLoad error:',e);});
+}
+
+function taskSave(){
+  var goal=$('goal').value.trim();
+  if(!goal){return;}
+  var name=goal.length>20?goal.slice(0,20)+'...':goal;
+  fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,goal:goal,description:'',mode:'money'})})
+  .then(function(r){return r.json()}).then(function(d){
+    if(d.error){return;}
+    taskLoad();
+  }).catch(function(e){console.error('taskSave error:',e);});
+}
+
+function taskRun(id){
+  fetch('/api/tasks/'+id).then(function(r){return r.json()}).then(function(t){
+    if(t.error){return;}
+    $('goal').value=t.goal;
+    fetch('/api/tasks/'+id+'/start',{method:'POST'});
+    toggle();
+  });
+}
+
+function taskDelete(id){
+  fetch('/api/tasks/'+id,{method:'DELETE'}).then(function(){taskLoad();});
+}
+
+function taskEdit(id){
+  fetch('/api/tasks/'+id).then(function(r){return r.json()}).then(function(t){
+    if(t.error){return;}
+    $('goal').value=t.goal;
+  });
+}
+
+setTimeout(taskLoad,600);
+
+/* === 页面初始化：恢复最近 session 的历史记录 === */
+(function restoreLastSession(){
+  fetch('/api/last-session').then(function(r){return r.json()}).then(function(d){
+    if(d.empty){loadSessions();return;}
+    // 如果当前有运行中任务，poll 会接管，不需要恢复
+    if(running){loadSessions();return;}
+    // 恢复最近 session 的历史到面板
+    if(d.brain && d.brain.indexOf('AI 大脑等待启动')===-1){$('brain-body').innerHTML=d.brain;}
+    if(d.claw && d.claw.indexOf('小龙虾待命中')===-1){$('claw-body').innerHTML=d.claw;}
+    if(d.memory && d.memory.indexOf('白板是空的')===-1){$('mem-body').innerHTML=d.memory;}
+    var lc=d.loop_count||0;
+    $('r-badge').textContent='Round '+lc;
+    $('s-text').textContent='已停止（Round '+lc+'）';
+    $('s-dot').className='dot dot-x';
+    // 记住 session_id，方便"继续执行"
+    if(d.id){continueFromSid=d.id;currentTaskId='';}
+    // 只在有实际历史时显示"继续执行"
+    if(lc>0){
+      $('gobtn').innerHTML='继续执行';
+    } else {
+      $('gobtn').innerHTML='启动新任务';
+    }
+    $('gobtn').className='btn btn-go';
+    $('gobtn').disabled=false;
+    loadSessions();
+  }).catch(function(e){console.error('restoreLastSession error:',e);loadSessions();});
+})();
+
 document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&document.activeElement===$('chat-input')){e.preventDefault();sendChat();}});
 </script>"""
 
-    # 快速目标按钮（不用 unicode escape，直接中文）
-    qbtn1 = f'<button class="qbtn" onclick="setg(this)">&#x1F50D; 获客分析 &mdash; 找到转化率最高的渠道</button>'
-    qbtn2 = f'<button class="qbtn" onclick="setg(this)">&#x1F4B0; 定价调研 &mdash; Gumroad AI prompt 竞品分析</button>'
-    qbtn3 = f'<button class="qbtn" onclick="setg(this)">&#x1F4AC; Reddit 挖掘 &mdash; AI automation 赚钱成功案例</button>'
+    # 快速目标按钮
+    qbtn1 = f'<button class="qbtn" onclick="setg(this)">PPT模板售卖</button>'
+    qbtn2 = f'<button class="qbtn" onclick="setg(this)">AI Prompt Pack</button>'
+    qbtn3 = f'<button class="qbtn" onclick="setg(this)">Notion模板</button>'
+    qbtn4 = f'<button class="qbtn" onclick="setg(this)">AI代写文章</button>'
+    qbtn5 = f'<button class="qbtn" onclick="setg(this)">AI设计素材</button>'
 
     brain_html = render_brain_entries()
     claw_html = render_claw_entries()
     mem_html = render_memory()
+    out_html = render_outputs()
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -455,16 +1570,28 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
 
 <!-- 左侧 -->
 <div id="left">
-  <div class="logo-row"><div class="logo">M</div><div class="logo-text"><h1>自主赚钱系统</h1><p>Autonomous Money Maker v2</p></div></div>
+  <div class="logo-row"><div class="logo"><svg viewBox="0 0 60 60" width="24" height="24"><path d="M30,2 L35,18 L52,22 L35,26 L38,48 L30,36 L22,48 L25,26 L8,22 L25,18 Z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/><circle cx="30" cy="26" r="5" fill="#fff"/></svg></div><div class="logo-text"><h1>claw-brain</h1><p>自主决策系统</p><span class="dev-tag">开发者：楚晴</span></div></div>
 
   <div class="card"><div class="card-label">系统状态</div>
     <div class="srow"><div class="dot dot-x" id="s-dot"></div><span class="label" id="s-text">待命中</span></div>
     <div class="srow"><div class="dot dot-g" id="brain-dot"></div><span class="label">AI 大脑</span><span class="val" id="brain-model">DeepSeek</span></div>
     <div class="srow"><div class="dot dot-g" id="gw-dot"></div><span class="label">小龙虾 Gateway</span><span class="val">:18789</span></div>
+    <div id="task-bar" style="display:none;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
   </div>
 
   <div class="card"><div class="card-label">目标设定</div>
-    <textarea class="inp" id="goal" placeholder="输入你的终极目标...">分析当前获客渠道，找到转化率最高的方式并持续放大，直到产生真实收入。</textarea>
+    <textarea class="inp" id="goal" placeholder="输入你的目标..." rows="3"></textarea>
+    <div style="display:flex;gap:6px">
+      <button class="goal-save" onclick="taskSave()" style="flex:1">+ 保存为目标</button>
+    </div>
+    <div class="goal-tags" id="goal-tags"></div>
+  </div>
+
+  <div class="card"><div class="card-label">快速模式</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn mode-btn" id="mode-money" onclick="setMode('money')" style="flex:1;font-size:12px">&#x1F4B0; 赚钱模式</button>
+      <button class="btn mode-btn" id="mode-dev" onclick="setMode('dev')" style="flex:1;font-size:12px">&#x1F6E0; 开发模式</button>
+    </div>
   </div>
 
   <div class="card"><div class="card-label">参数配置</div>
@@ -473,14 +1600,21 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
     <span class="lbl" style="margin-left:auto">间隔(秒)</span><input type="number" class="inp num" id="ival" value="15" min="5" max="300"></div>
   </div>
 
-  <button class="btn btn-go" id="gobtn" onclick="toggle()">启动系统</button>
+  <button class="btn btn-go" id="gobtn" onclick="toggle()">启动新任务</button>
 
   <div class="card"><div class="card-label">快速目标模板</div>
     <div style="display:flex;flex-direction:column;gap:6px">
       {qbtn1}
       {qbtn2}
       {qbtn3}
+      {qbtn4}
+      {qbtn5}
     </div>
+  </div>
+
+  <div class="card"><div class="card-label">账号管理</div>
+    <div class="cred-list" id="cred-list"><div class="cred-empty">加载中...</div></div>
+    <button class="cred-add-btn" onclick="credOpenModal()">+ 添加账号</button>
   </div>
 </div>
 
@@ -489,7 +1623,11 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
   <div class="tabs">
     <button class="tab on" id="t-brain" onclick="stab('brain')">&#x1F9E0; AI 大脑思考板</button>
     <button class="tab" id="t-claw" onclick="stab('claw')">&#x1F980; 小龙虾监控</button>
+    <button class="tab" id="t-out" onclick="stab('out')">&#x1F4E6; 产物展示</button>
     <button class="tab" id="t-mem" onclick="stab('mem')">&#x1F4BE; 记忆白板</button>
+  </div>
+  <div class="sess-bar" id="sess-bar">
+    <div class="sess-empty" id="sess-empty">加载中...</div>
   </div>
 
   <div class="board" id="p-brain">
@@ -504,10 +1642,16 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
     <div class="bfoot"><div class="bf-item">Agent: <strong id="c-agent">main</strong></div><div class="bf-item">Gateway: <strong>:18789</strong></div><div class="bf-item">模式: <strong>CLI</strong></div></div>
   </div>
 
+  <div class="board hide" id="p-out">
+    <div class="bhead"><div class="bhead-l"><div class="bicon" style="background:rgba(59,130,246,0.12);color:#3b82f6">&#x1F4E6;</div><span class="bname">产物展示</span></div><span class="badge" id="out-badge">0 个产物</span></div>
+    <div class="bbody" id="out-body">{out_html}</div>
+    <div class="bfoot"><div class="bf-item">存储: <strong>outputs/</strong></div><div class="bf-item">类型: <strong>代码 / 文档 / 工具</strong></div></div>
+  </div>
+
   <div class="board hide" id="p-mem">
     <div class="bhead"><div class="bhead-l"><div class="bicon bicon-mem">&#x1F4CB;</div><span class="bname">记忆白板</span></div></div>
     <div class="bbody" id="mem-body">{mem_html}</div>
-    <div class="bfoot"><div class="bf-item">存储: <strong>JSON 文件</strong></div><div class="bf-item">容量: <strong>最近 50 条</strong></div></div>
+    <div class="bfoot"><div class="bf-item">存储: <strong>自动保存</strong></div><div class="bf-item">容量: <strong>最近 200 条</strong></div></div>
   </div>
 </div>
 
@@ -523,7 +1667,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
     </div>
     <div class="chat-body" id="chat-body"><div class="chat-empty">暂无对话</div></div>
     <div class="chat-foot">
-      <input class="chat-input" id="chat-input" placeholder="输入你的回复..." autocomplete="off">
+      <input class="chat-input" id="chat-input" placeholder="输入指令或反馈..." autocomplete="off">
       <button class="chat-send" onclick="sendChat()">&#x27A4;</button>
     </div>
   </div>
@@ -536,152 +1680,33 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
 
 
 # ===================== 后台循环 =====================
-
-def run_loop(goal: str, agent: str, max_loops: int, interval: int):
-    global system_running, loop_count, pending_question, user_answer
-    import traceback
-
-    print(f"[LOOP] 启动 run_loop: goal={goal[:30]}..., agent={agent}, max_loops={max_loops}")
-
-    mem = Memory(MEMORY_FILE)
-    brain = Brain(BRAIN_API_KEY, BRAIN_BASE_URL, BRAIN_MODEL)
-
-    try:
-        claw = OpenClawClient(agent, SESSION_KEY, OPENCLAW_GATEWAY_URL)
-    except Exception as e:
-        print(f"[LOOP] OpenClaw 初始化失败: {e}")
-        traceback.print_exc()
-        brain_log.append({
-            "round": 0, "thought": f"OpenClaw 初始化失败: {e}",
-            "observation": "system_error", "action": "",
-            "update_memory": "", "status": "blocked",
-        })
-        with state_lock:
-            system_running = False
-        return
-
-    last_fb = "系统刚刚启动，请开始第一步行动。"
-    print(f"[LOOP] OpenClaw 初始化成功，进入主循环")
-
-    while True:
-        with state_lock:
-            if not system_running:
-                print("[LOOP] system_running=False, 退出循环")
-                break
-        loop_count += 1
-        if 0 < max_loops < loop_count:
-            print(f"[LOOP] 达到最大轮数 {max_loops}, 退出")
-            break
-
-        print(f"[LOOP] Round {loop_count} - 开始")
-        event_queue.put(("status", f"Round {loop_count} - Brain 思考中..."))
-
-        try:
-            ctx = {
-                "goal": goal,
-                "memory_summary": mem.get_summary(),
-                "last_feedback": last_fb,
-                "history_summary": mem.get_summary(3),
-                "loop_count": loop_count,
-            }
-            dec = brain.think(ctx)
-            print(f"[LOOP] Round {loop_count} - Brain 返回: status={dec.get('status')}, action={dec.get('action_to_openclaw','')[:50]}")
-        except Exception as e:
-            print(f"[LOOP] Round {loop_count} - Brain 错误: {e}")
-            traceback.print_exc()
-            brain_log.append({
-                "round": loop_count, "thought": f"Brain 调用失败: {e}",
-                "observation": "api_error", "action": "",
-                "update_memory": "", "status": "blocked",
-            })
-            break
-
-        thought = dec.get("thought", "")
-        observation = dec.get("observation", "")
-        action = dec.get("action_to_openclaw", "").strip()
-        upd = dec.get("update_memory", "")
-        st = dec.get("status", "continue")
-
-        brain_log.append({
-            "round": loop_count, "thought": thought, "observation": observation,
-            "action": action, "update_memory": upd, "status": st,
-        })
-
-        if st == "need_input":
-            # Brain 需要用户输入，暂停等待
-            question = dec.get("question_for_user", thought) or "系统需要你的输入"
-            print(f"[LOOP] Round {loop_count} - 需要用户输入: {question}")
-            with state_lock:
-                pending_question = question
-            chat_history.append({"role": "sys", "text": question})
-            event_queue.put(("status", f"Round {loop_count} - 等待用户输入..."))
-
-            # 等待用户回复
-            answer_event.clear()
-            answer_event.wait(timeout=300)  # 最多等5分钟
-
-            with state_lock:
-                pending_question = ""
-            if not user_answer:
-                last_fb = "用户超时未回复"
-            else:
-                last_fb = f"用户回复: {user_answer}"
-                print(f"[LOOP] Round {loop_count} - 用户回复: {user_answer}")
-                user_answer = ""
-            _wait(2)
-            continue
-
-        if st in ("blocked", "pause"):
-            print(f"[LOOP] Round {loop_count} - 大脑要求停止: {st}")
-            break
-        if upd:
-            mem.update_strategy(upd)
-        if st == "milestone" and upd:
-            mem.add_milestone(upd)
-
-        if not action:
-            last_fb = "大脑未给出指令"
-            print(f"[LOOP] Round {loop_count} - 无指令，等待 {interval}s")
-            _wait(interval)
-            continue
-
-        event_queue.put(("status", f"Round {loop_count} - 小龙虾执行中..."))
-        print(f"[LOOP] Round {loop_count} - 调用 OpenClaw: {action[:60]}...")
-        try:
-            result = claw.execute(action)
-            print(f"[LOOP] Round {loop_count} - OpenClaw 返回: success={result['success']}")
-        except Exception as e:
-            print(f"[LOOP] Round {loop_count} - OpenClaw 执行异常: {e}")
-            traceback.print_exc()
-            result = {"success": False, "content": f"执行异常: {e}"}
-
-        claw_log.append({
-            "round": loop_count, "instruction": action,
-            "result": result["content"], "success": result["success"],
-        })
-
-        mem.add_action(action, result["content"], result["success"])
-        last_fb = result["content"] if result["success"] else f"失败: {result['content']}"
-
-        _wait(interval)
-
-    with state_lock:
-        system_running = False
-    event_queue.put(("status", "已停止"))
-    print("[LOOP] run_loop 结束")
-
-
-def _wait(seconds):
-    for _ in range(seconds):
-        with state_lock:
-            if not system_running:
-                return
-        time.sleep(1)
+# 核心逻辑已提取到 core.py，此处仅保留 Web Console 专用的启动封装
 
 
 # ===================== FastAPI =====================
 
 app = FastAPI(title="自主赚钱系统")
+
+# ===== 闲置检测：更新最后活动时间 =====
+def _touch_activity():
+    """标记一次用户活动（由关键 API 端点调用）"""
+    global LAST_ACTIVITY_TIME
+    LAST_ACTIVITY_TIME = time.time()
+
+# 挂载 outputs/ 为静态文件，让浏览器可以直接访问产物文件（图片、视频等）
+try:
+    app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+except Exception as e:
+    print(f"[WARN] 静态文件挂载失败: {e}")
+
+# 挂载 OpenClaw workspace 为静态文件，让浏览器可以直接查看 OpenClaw 生成的截图等产物
+OPENCLAW_WS = Path.home() / ".openclaw" / "workspace"
+if OPENCLAW_WS.is_dir():
+    try:
+        app.mount("/openclaw-ws", StaticFiles(directory=str(OPENCLAW_WS)), name="openclaw-ws")
+        print(f"  [OK] OpenClaw workspace 已挂载: {OPENCLAW_WS}")
+    except Exception as e:
+        print(f"[WARN] OpenClaw workspace 挂载失败: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -691,10 +1716,7 @@ async def index():
 
 @app.post("/api/start")
 async def api_start(req: Request):
-    global system_running, loop_count, brain_log, claw_log
-    with state_lock:
-        if system_running:
-            return JSONResponse({"error": "系统已在运行中"})
+    _touch_activity()
     try:
         body = await req.json()
     except Exception as e:
@@ -703,8 +1725,12 @@ async def api_start(req: Request):
 
     goal = body.get("goal", "").strip()
     agent = body.get("agent", "main")
-    max_loops = int(body.get("max_loops", 10))
-    interval = int(body.get("loop_interval", 15))
+    try:
+        max_loops = int(body.get("max_loops", 10))
+        interval = int(body.get("loop_interval", 15))
+    except (ValueError, TypeError):
+        max_loops, interval = 10, 15
+    continue_from = body.get("continue_from", "")
 
     if not goal:
         return JSONResponse({"error": "请输入目标"})
@@ -713,42 +1739,220 @@ async def api_start(req: Request):
         return JSONResponse({"error": "未设置 BRAIN_API_KEY 环境变量。请在 .env 文件或系统环境中配置。"})
 
     # 健康检查
+    import urllib.request
+    gateway_ok = False
     try:
-        import urllib.request
         urllib.request.urlopen(f"{OPENCLAW_GATEWAY_URL}/health", timeout=5)
-        print(f"[API] OpenClaw Gateway 健康检查通过")
+        gateway_ok = True
     except Exception as e:
-        print(f"[API] OpenClaw Gateway 健康检查失败: {e}")
-        return JSONResponse({"error": f"OpenClaw Gateway 离线: {e}。请先运行 openclaw gateway run --force"})
+        print(f"[API] Gateway 健康检查失败: {e}，等待重试...")
+        time.sleep(3)
+        if _ensure_gateway():
+            gateway_ok = True
+    if not gateway_ok:
+        return JSONResponse({"error": "OpenClaw Gateway 离线。请使用桌面启动器重启系统。"})
 
-    with state_lock:
-        system_running = True
-        loop_count = 0
-        brain_log = []
-        claw_log = []
-    while not event_queue.empty():
-        event_queue.get_nowait()
+    # 如果有旧 Worker 在跑，先停止
+    global _worker_process
+    if _is_worker_alive():
+        print("[API] 检测到活跃 Worker，发送停止命令")
+        _send_command({"action": "stop"})
+        time.sleep(2)
+        if _worker_process is not None and _worker_process.poll() is None:
+            _worker_process.terminate()
+            try:
+                _worker_process.wait(timeout=5)
+            except Exception:
+                _worker_process.kill()
+        _worker_process = None
 
-    print(f"[API] 启动系统: goal={goal[:30]}..., agent={agent}, max_loops={max_loops}")
-    t = threading.Thread(target=run_loop, args=(goal, agent, max_loops, interval), daemon=True)
-    t.daemon = True
-    t.start()
-    print(f"[API] 后台线程已启动: {t.name}, is_alive={t.is_alive()}")
-    return JSONResponse({"ok": True})
+    # 兜底：杀掉任何遗留的 Worker 进程（Web Server 重启后可能存在）
+    _kill_orphan_worker()
+
+    # 等到所有 Worker 进程真正消失（最多 3 秒）
+    for _ in range(15):
+        snap_check = _read_snapshot()
+        if not snap_check:
+            break
+        pid = snap_check.get("pid", 0)
+        if not pid or not _pid_exists(pid):
+            break
+        time.sleep(0.2)
+
+    # 创建任务参数
+    task_id = f"t_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    session_key = f"task-{task_id}"
+    memory_file = f"memory_{task_id}.json"
+
+    # 继续上次任务
+    prev_loop_count = 0
+    prev_brain_log = None
+    prev_claw_log = None
+    current_session_id = ""
+
+    if continue_from:
+        old_sess = session_mgr.get_session(continue_from)
+        if old_sess:
+            old_brain_log = old_sess.get("brain_log", [])
+            old_claw_log = old_sess.get("claw_log", [])
+            prev_loop_count = old_sess.get("loop_count", 0)
+            prev_brain_log = old_brain_log
+            prev_claw_log = old_claw_log
+            # 复用旧 Session ID——不创建新 Session
+            current_session_id = continue_from
+            if old_brain_log:
+                print(f"[API] 继续任务: 已加载 {len(old_brain_log)} 条 brain_log, {prev_loop_count} 轮历史")
+            progress_lines = []
+            for entry in old_brain_log[-10:]:
+                status = entry.get("status", "")
+                thought = entry.get("thought", "")[:100]
+                action = entry.get("action", "")[:80]
+                if thought or action:
+                    progress_lines.append(f"  R{entry.get('round','?')} [{status}]: {thought or action}")
+            progress_text = "\n".join(progress_lines) if progress_lines else "（无详细记录）"
+            goal = f"{goal}\n\n[继续上次任务：之前已跑{prev_loop_count}轮。以下是最近进展：\n{progress_text}\n请基于以上进展继续推进，不要重复已经做过的事情。]"
+
+    # 归档上一个会话（仅当不是继续同一个会话时）
+    if not continue_from and session_mgr.current_id:
+        session_mgr.archive_session(session_mgr.current_id, "stopped")
+
+    # 创建新会话（仅当不是继续时）
+    if not current_session_id:
+        current_session_id = session_mgr.create_session(goal, agent)
+    else:
+        # 继续旧会话——标记为 running
+        session_mgr._current_id = current_session_id
+        for entry in session_mgr._index:
+            if entry["id"] == current_session_id:
+                entry["status"] = "running"
+                break
+        session_mgr._save_index()
+
+    # 写入启动参数到 pipe/startup.json
+    # 如果是继续任务，复用旧的 memory 文件
+    if continue_from and prev_brain_log:
+        old_memory_files = list(Path(__file__).parent.glob(f"memory_*{continue_from}*.json"))
+        if old_memory_files:
+            memory_file = str(old_memory_files[0])
+
+    startup_data = {
+        "goal": goal, "agent": agent, "max_loops": max_loops, "interval": interval,
+        "task_id": task_id, "session_id": current_session_id,
+        "session_key": session_key, "memory_file": memory_file,
+        "continue_from": continue_from,
+        "prev_loop_count": prev_loop_count,
+        "prev_brain_log": prev_brain_log,
+        "prev_claw_log": prev_claw_log,
+    }
+    startup_file = PIPE_DIR / "startup.json"
+    startup_file.write_text(json.dumps(startup_data, ensure_ascii=False), encoding="utf-8")
+
+    # 清理旧的快照和命令文件
+    for f in [SNAPSHOT_FILE, COMMAND_FILE]:
+        f.unlink(missing_ok=True)
+    for f in PIPE_DIR.glob("*.tmp"):
+        f.unlink(missing_ok=True)
+    (PIPE_DIR / "inject.json").unlink(missing_ok=True)
+    (PIPE_DIR / "answer.json").unlink(missing_ok=True)
+
+    # 启动 Worker 子进程
+    python_exe = r"C:\Users\楚\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+    worker_script = str(Path(__file__).parent / "worker.py")
+
+    # Worker stdout 写日志文件；保持文件引用防止 GC
+    global _worker_log_file
+    worker_log_path = PIPE_DIR / "worker.log"
+    # 确保文件存在并清空旧内容
+    worker_log_path.write_text("", encoding="utf-8")
+    _worker_log_file = open(worker_log_path, "a", encoding="utf-8", errors="replace")
+    print(f"[API] Worker log: {worker_log_path}, fd={_worker_log_file.fileno()}")
+    _worker_process = subprocess.Popen(
+        [python_exe, "-u", worker_script],
+        stdin=subprocess.DEVNULL,
+        stdout=_worker_log_file,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        cwd=str(Path(__file__).parent),
+    )
+    print(f"[API] Worker Popen: PID={_worker_process.pid}, poll={_worker_process.poll()}")
+    # 注意：task_id / session_id 由 Worker 写入快照，前端通过 /api/state 从快照读取
+    # 不再依赖全局变量
+
+    # 注入暂存的用户消息
+    global pending_user_feedbacks
+    if pending_user_feedbacks:
+        for fb in pending_user_feedbacks:
+            _send_command({
+                "action": "inject_feedback",
+                "task_id": task_id,
+                "text": fb.get("text", ""),
+            })
+        print(f"[API] 注入 {len(pending_user_feedbacks)} 条暂存用户消息")
+        pending_user_feedbacks = []
+
+    print(f"[API] Worker 启动: PID={_worker_process.pid}, task_id={task_id}, goal={goal[:30]}...")
+
+    # 验证 Worker 真正启动：等1秒检查进程是否还活着
+    time.sleep(1)
+    if _worker_process.poll() is not None:
+        # Worker 启动后立刻退出了——读取日志文件
+        exit_code = _worker_process.returncode
+        err_output = ""
+        try:
+            err_output = (PIPE_DIR / "worker.log").read_text(encoding="utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        _worker_process = None
+        print(f"[API] Worker 启动后立刻退出 (exit={exit_code}): {err_output[:200]}")
+        return JSONResponse({"error": f"Worker 启动失败 (exit={exit_code}): {err_output[:200]}"})
+
+    return JSONResponse({"ok": True, "task_id": task_id, "session_id": current_session_id})
 
 
 @app.post("/api/stop")
-async def api_stop():
-    global system_running, pending_question
-    with state_lock:
-        system_running = False
-        pending_question = ""
+async def api_stop(req: Request):
+    """停止当前 Worker"""
+    global _worker_process
+    _send_command({"action": "stop"})
+    # 等待 Worker 退出
+    if _worker_process and _worker_process.poll() is None:
+        try:
+            _worker_process.wait(timeout=5)
+        except Exception:
+            _worker_process.terminate()
+    _worker_process = None
+
+    # 停止后立即从快照保存 Session 日志（Worker 可能没来得及保存）
+    snap = _read_snapshot()
+    if snap and snap.get("session_id"):
+        try:
+            bl = snap.get("brain_log", [])
+            cl = snap.get("claw_log", [])
+            if bl or cl:
+                session_mgr.save_session_logs(snap["session_id"], bl, cl)
+        except Exception as e:
+            print(f"[API] 停止后保存 Session 日志失败: {e}")
+
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/clear")
+async def api_clear():
+    """清空当前快照"""
+    # 清空快照文件中的日志
+    snap = _read_snapshot()
+    if snap:
+        snap["brain_log"] = []
+        snap["claw_log"] = []
+        snap["chat_history"] = []
+        snap["loop_count"] = 0
+        _atomic_write_snapshot(snap)
     return JSONResponse({"ok": True})
 
 
 @app.post("/api/answer")
 async def api_answer(req: Request):
-    global user_answer, pending_question
+    _touch_activity()
     try:
         body = await req.json()
     except Exception:
@@ -756,52 +1960,542 @@ async def api_answer(req: Request):
     answer = body.get("answer", "").strip()
     if not answer:
         return JSONResponse({"error": "回复不能为空"})
-    with state_lock:
-        if not pending_question:
-            return JSONResponse({"error": "当前没有需要回答的问题"})
-        chat_history.append({"role": "usr", "text": answer})
-        user_answer = answer
-        pending_question = ""
-    answer_event.set()
-    return JSONResponse({"ok": True, "messages": chat_history[-20:]})
+
+    _send_command({"action": "answer", "answer": answer})
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/chat")
+async def api_chat(req: Request):
+    """随时接收用户消息 - 支持即时操作和反馈注入"""
+    import webbrowser as _wb
+    import re as _re
+
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误"})
+
+    text = body.get("message", "").strip()
+    # task_id 从快照取，不依赖全局变量
+    snap = _read_snapshot()
+    task_id = body.get("task_id") or (snap.get("task_id") if snap else "")
+
+    if not text:
+        return JSONResponse({"error": "消息不能为空"})
+
+    # === 即时操作：关键词匹配，不经过 Brain ===
+    _QUICK_PATTERNS = [
+        (r"打开.{0,4}(网页|控制台|浏览器|页面)", lambda: _wb.open("http://127.0.0.1:7860")),
+        (r"(再|重新|帮我).{0,4}打开", lambda: _wb.open("http://127.0.0.1:7860")),
+        (r"open\s+(browser|page|console|web)", lambda: _wb.open("http://127.0.0.1:7860")),
+    ]
+    for pattern, action_fn in _QUICK_PATTERNS:
+        if _re.search(pattern, text.lower()):
+            try:
+                action_fn()
+                return JSONResponse({"ok": True, "quick_action": "opened_browser", "messages": []})
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e), "messages": []})
+
+    # === 注入到 Worker ===
+    snap = _read_snapshot()
+    if _is_worker_alive() and snap and snap.get("running"):
+        # Worker 正在运行——注入反馈或回答
+        if snap.get("has_question"):
+            _send_command({"action": "answer", "answer": text})
+            return JSONResponse({"ok": True, "type": "answer"})
+        else:
+            snap_tid = snap.get("task_id", "") if snap else ""
+            _send_command({"action": "inject_feedback", "task_id": snap_tid, "text": text})
+            return JSONResponse({"ok": True, "type": "feedback"})
+    else:
+        # Worker 不在运行——暂存消息
+        pending_user_feedbacks.append({"role": "usr", "text": text, "time": time.strftime("%H:%M:%S")})
+        return JSONResponse({
+            "ok": False,
+            "type": "queued",
+            "error": "当前没有运行中的任务，消息已暂存。启动新任务后 Brain 会自动看到你的指示。",
+            "messages": list(pending_user_feedbacks[-20:]),
+        })
 
 
 @app.get("/api/state")
-async def api_state():
-    global loop_count, system_running
+def api_state(task_id: str = ""):
+    _touch_activity()
+    """读快照文件——唯一真实源。Worker 在不在跑由快照里的 running 字段决定，不依赖全局变量。"""
+    snap = _read_snapshot()
+    if not snap or not snap.get("task_id"):
+        # 没有 Worker 快照——从磁盘读取最后一个有日志的 Session 作为 fallback
+        last_sess = _read_last_session_from_disk()
+        if last_sess:
+            return JSONResponse({
+                "brain": render_brain_entries(last_sess.get("brain_log", [])),
+                "claw": render_claw_entries(last_sess.get("claw_log", [])),
+                "memory": render_memory(),
+                "outputs": render_outputs(),
+                "status": "已停止",
+                "round": last_sess.get("loop_count", 0),
+                "claw_count": len(last_sess.get("claw_log", [])),
+                "output_count": len(output_manager.get_recent_outputs(100)),
+                "chat_messages": last_sess.get("chat_history", [])[-20:],
+                "has_question": last_sess.get("has_question", False),
+                "session_id": last_sess.get("session_id", ""),
+                "task_id": "",
+                "tasks": [],
+                "last_activity_time": LAST_ACTIVITY_TIME,
+                "idle_timeout": IDLE_TIMEOUT_SECONDS,
+            })
 
-    # 消费事件
-    while not event_queue.empty():
-        try:
-            event_queue.get_nowait()
-        except Exception:
-            break
+        return JSONResponse({
+            "brain": render_brain_entries(),
+            "claw": render_claw_entries(),
+            "memory": render_memory(),
+            "outputs": render_outputs(),
+            "status": "待命中",
+            "round": 0,
+            "claw_count": 0,
+            "output_count": len(output_manager.get_recent_outputs(100)),
+            "chat_messages": [],
+            "has_question": False,
+            "session_id": "",
+            "task_id": "",
+            "tasks": [],
+            "last_activity_time": LAST_ACTIVITY_TIME,
+            "idle_timeout": IDLE_TIMEOUT_SECONDS,
+        })
 
-    with state_lock:
-        lc = loop_count
-        sr = system_running
-        pq = pending_question
-        ch = list(chat_history[-20:])
-
-    status = f"运行中 - Round {lc}" if sr else "已停止"
+    is_alive = _is_worker_alive()
+    running = snap.get("running", False)
+    status = snap.get("status_text", "运行中")
+    if not is_alive and running:
+        status = "已停止"
+    elif running:
+        status = f"运行中 - Round {snap.get('loop_count', 0)}"
 
     return JSONResponse({
-        "brain": render_brain_entries(),
-        "claw": render_claw_entries(),
+        "brain": render_brain_entries(snap.get("brain_log", [])),
+        "claw": render_claw_entries(snap.get("claw_log", [])),
         "memory": render_memory(),
+        "outputs": render_outputs(),
         "status": status,
-        "round": lc,
-        "claw_count": len(claw_log),
-        "chat_messages": ch,
-        "has_question": bool(pq),
+        "round": snap.get("loop_count", 0),
+        "claw_count": len(snap.get("claw_log", [])),
+        "output_count": len(output_manager.get_recent_outputs(100)),
+        "chat_messages": snap.get("chat_history", [])[-20:],
+        "has_question": snap.get("has_question", False),
+        "session_id": snap.get("session_id", ""),
+        "task_id": snap.get("task_id", ""),
+        "tasks": [{
+            "task_id": snap.get("task_id", ""),
+            "goal": snap.get("goal", "")[:60],
+            "agent": snap.get("agent", "main"),
+            "running": is_alive and running,
+            "round": snap.get("loop_count", 0),
+            "start_time": snap.get("started_at", ""),
+            "active": True,
+        }],
+        "last_activity_time": LAST_ACTIVITY_TIME,
+        "idle_timeout": IDLE_TIMEOUT_SECONDS,
     })
+
+
+@app.get("/api/output/{output_id}")
+async def api_get_output(output_id: str):
+    """获取产物完整内容"""
+    out = output_manager.get_output(output_id)
+    if not out:
+        return JSONResponse({"error": "产物不存在"}, status_code=404)
+    return JSONResponse({
+        "id": out["id"],
+        "type": out["type"],
+        "title": out["title"],
+        "content": out.get("full_content") or out["content"],
+        "timestamp": out["timestamp"],
+        "file_path": out.get("file_path", ""),
+    })
+
+
+@app.get("/api/sessions")
+async def api_list_sessions():
+    """列出所有会话（索引，不含日志）"""
+    return JSONResponse({"sessions": session_mgr.list_sessions()})
+
+
+@app.get("/api/last-session")
+def api_last_session():
+    """返回最近一个有日志的会话数据（前端刷新后恢复历史用）"""
+    return _get_last_session_sync()
+
+
+def _get_last_session_sync():
+    """同步获取最近 session——优先返回有日志的，其次返回最近的"""
+    sessions = session_mgr.list_sessions(30)
+    for s in sessions:
+        # 找第一个有实际日志的 session（宽松判断：loop_count > 0 或有 brain_log 数据）
+        full = session_mgr.get_session(s["id"])
+        if not full:
+            continue
+        bl = full.get("brain_log", [])
+        cl = full.get("claw_log", [])
+        if bl or cl or s.get("loop_count", 0) > 0:
+            return JSONResponse({
+                "id": full["id"],
+                "goal": full["goal"],
+                "status": full["status"],
+                "loop_count": full.get("loop_count", 0),
+                "brain": render_brain_entries(bl),
+                "claw": render_claw_entries(cl),
+                "memory": render_memory(),
+            })
+    return JSONResponse({"empty": True})
+
+
+@app.get("/api/sessions/{session_id}")
+async def api_get_session(session_id: str):
+    """获取指定会话的完整日志（渲染为 HTML）"""
+    sess = session_mgr.get_session(session_id)
+    if not sess:
+        return JSONResponse({"error": "会话不存在"}, status_code=404)
+    # 直接传入历史日志渲染，不再修改全局 state
+    brain_html = render_brain_entries(sess.get("brain_log", []))
+    claw_html = render_claw_entries(sess.get("claw_log", []))
+
+    return JSONResponse({
+        "id": sess["id"],
+        "goal": sess["goal"],
+        "agent": sess.get("agent", "main"),
+        "status": sess["status"],
+        "start_time": sess["start_time"],
+        "end_time": sess.get("end_time", ""),
+        "loop_count": sess.get("loop_count", 0),
+        "brain": brain_html,
+        "claw": claw_html,
+        "brain_plain": sess.get("brain_plain", ""),
+    })
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    """删除指定会话"""
+    import os as _os
+    # 不允许删除正在运行的任务
+    snap = _read_snapshot()
+    if snap and snap.get("session_id") == session_id:
+        return JSONResponse({"error": "不能删除正在运行的任务"}, status_code=400)
+
+    sess = session_mgr.get_session(session_id)
+    if not sess:
+        return JSONResponse({"error": "会话不存在"}, status_code=404)
+
+    # 删除 session 文件
+    session_file = _os.path.join(SESSIONS_DIR, f"{session_id}.json")
+    if _os.path.exists(session_file):
+        _os.remove(session_file)
+
+    # 更新 index.json
+    idx_file = _os.path.join(SESSIONS_DIR, "index.json")
+    if _os.path.exists(idx_file):
+        with open(idx_file, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+        idx = [e for e in idx if e.get("id") != session_id]
+        with open(idx_file, "w", encoding="utf-8") as f:
+            json.dump(idx, f, ensure_ascii=False, indent=2)
+
+    return JSONResponse({"ok": True, "deleted": session_id})
+
+
+@app.get("/api/sessions/{session_id}/continue")
+async def api_continue_session(session_id: str):
+    """获取继续上一个任务所需的上下文（原始 goal + 最后几轮 Brain 分析摘要）"""
+    sess = session_mgr.get_session(session_id)
+    if not sess:
+        return JSONResponse({"error": "会话不存在"}, status_code=404)
+
+    # 提取原始 goal（去掉之前拼接的 "[继续上次任务" 后缀）
+    raw_goal = sess["goal"]
+    cont_marker = "\n[继续上次任务"
+    if cont_marker in raw_goal:
+        raw_goal = raw_goal[:raw_goal.index(cont_marker)].strip()
+
+    # 提取最后几轮 Brain 的 thought/observation 作为上下文摘要
+    brain_log = sess.get("brain_log", [])
+    last_rounds = []
+    for entry in brain_log[-6:]:  # 最后6轮
+        thought = entry.get("thought", "")
+        obs = entry.get("observation", "")
+        action = entry.get("action", "")
+        status = entry.get("status", "")
+        if thought:
+            last_rounds.append(f"[{status}] {thought[:200]}")
+        if action and status not in ("quality_check",):
+            last_rounds.append(f"  执行: {action[:100]}")
+
+    # 渲染历史日志为 HTML，让前端能直接显示
+    brain_html = render_brain_entries(sess.get("brain_log", []))
+    claw_html = render_claw_entries(sess.get("claw_log", []))
+
+    return JSONResponse({
+        "goal": raw_goal,
+        "loop_count": sess.get("loop_count", 0),
+        "context": "\n".join(last_rounds) if last_rounds else "（无分析记录）",
+        "brain": brain_html,
+        "claw": claw_html,
+    })
+
+
+@app.post("/api/sessions/new")
+async def api_new_session():
+    _touch_activity()
+    """创建新空会话"""
+    sid = session_mgr.create_session("(新建任务)", "main")
+    return JSONResponse({"ok": True, "session_id": sid})
+
+
+# ===================== 凭据管理 API =====================
+
+@app.get("/api/credentials")
+async def api_cred_list():
+    """列出所有账号（脱敏）"""
+    return JSONResponse({"accounts": list_accounts(mask=True)})
+
+@app.get("/api/credentials/templates")
+async def api_cred_templates():
+    """获取账号分类模板"""
+    return JSONResponse({"templates": ACCOUNT_TEMPLATES, "presets": PRESET_FIELDS})
+
+@app.get("/api/credentials/{account_id}")
+async def api_cred_get(account_id: str):
+    """获取单个账号完整信息（不脱敏）"""
+    account = get_account(account_id)
+    if not account:
+        return JSONResponse({"error": "账号不存在"}, status_code=404)
+    return JSONResponse(account)
+
+@app.post("/api/credentials")
+async def api_cred_add(req: Request):
+    """添加新账号"""
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "JSON 解析失败"}, status_code=400)
+    name = body.get("name", "").strip()
+    category = body.get("category", "custom")
+    fields = body.get("fields", [])
+    if not name:
+        return JSONResponse({"error": "账号名称不能为空"}, status_code=400)
+    account = add_account(name, category, fields)
+    return JSONResponse(account)
+
+@app.put("/api/credentials/{account_id}")
+async def api_cred_update(account_id: str, req: Request):
+    """更新账号"""
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "JSON 解析失败"}, status_code=400)
+    account = update_account(
+        account_id,
+        name=body.get("name"),
+        category=body.get("category"),
+        fields=body.get("fields"),
+    )
+    if not account:
+        return JSONResponse({"error": "账号不存在"}, status_code=404)
+    return JSONResponse(account)
+
+@app.delete("/api/credentials/{account_id}")
+async def api_cred_delete(account_id: str):
+    """删除账号"""
+    ok = delete_account(account_id)
+    if not ok:
+        return JSONResponse({"error": "账号不存在"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+# ===================== 任务管理 API =====================
+
+@app.get("/api/tasks")
+async def api_task_list():
+    """获取任务列表"""
+    tm = get_task_manager()
+    tasks = tm.list_tasks(limit=50)
+    stats = tm.get_stats()
+    return JSONResponse({"tasks": tasks, "stats": stats})
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_task_get(task_id: str):
+    """获取任务详情"""
+    tm = get_task_manager()
+    task = tm.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return JSONResponse(task)
+
+
+@app.post("/api/tasks")
+async def api_task_create(req: Request):
+    """创建新任务"""
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "JSON 解析失败"}, status_code=400)
+
+    name = body.get("name", "").strip()
+    goal = body.get("goal", "").strip()
+    description = body.get("description", "").strip()
+    mode = body.get("mode", "money")
+
+    if not name or not goal:
+        return JSONResponse({"error": "任务名称和目标不能为空"}, status_code=400)
+
+    tm = get_task_manager()
+    task = tm.create_task(name=name, goal=goal, description=description, mode=mode)
+    return JSONResponse(task)
+
+
+@app.post("/api/tasks/{task_id}/start")
+async def api_task_start(task_id: str):
+    """标记任务为运行中"""
+    tm = get_task_manager()
+    task = tm.start_task(task_id)
+    if not task:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return JSONResponse(task)
+
+
+@app.post("/api/tasks/{task_id}/complete")
+async def api_task_complete(task_id: str, req: Request):
+    """标记任务为已完成"""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    tm = get_task_manager()
+    task = tm.complete_task(
+        task_id,
+        result=body.get("result"),
+        outputs=body.get("outputs")
+    )
+    if not task:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return JSONResponse(task)
+
+
+@app.delete("/api/tasks/{task_id}")
+async def api_task_delete(task_id: str):
+    """删除任务"""
+    tm = get_task_manager()
+    ok = tm.delete_task(task_id)
+    if not ok:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+# ===================== 网关自动启动 =====================
+
+def _ensure_gateway(gateway_port: int = 18789, timeout: int = 20) -> bool:
+    """检查 OpenClaw 网关是否在运行。返回是否就绪。"""
+    # 端口是否已被监听
+    for _ in range(3):
+        try:
+            sock = socket.create_connection(("127.0.0.1", gateway_port), timeout=1)
+            sock.close()
+            print(f"  [OK] OpenClaw 网关已就绪 (:{gateway_port})")
+            return True
+        except (OSError, ConnectionRefusedError):
+            pass
+
+    print(f"  [!] OpenClaw 网关未就绪 (:{gateway_port})，请先启动网关")
+    return False
 
 
 # ===================== 入口 =====================
 
+# 全局日志：将 print 和 stderr 写入日志文件，崩溃时可追溯
+import logging as _logging
+_CONSOLE_LOG = str(Path(__file__).parent / "logs" / "web_console_crash.log")
+Path(_CONSOLE_LOG).parent.mkdir(exist_ok=True)
+_logging.basicConfig(
+    filename=_CONSOLE_LOG, level=_logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+_logger = _logging.getLogger("web_console")
+
+
+class _StderrToLog:
+    """将未捕获的 stderr 写入日志"""
+    def __init__(self, fallback):
+        self._fallback = fallback
+    def write(self, msg):
+        if msg and msg.strip():
+            _logger.error(msg.rstrip())
+        self._fallback.write(msg)
+    def flush(self):
+        self._fallback.flush()
+
+
 if __name__ == "__main__":
+    import sys as _sys
+    import atexit
+    import signal as _signal
+
+    _sys.stderr = _StderrToLog(_sys.stderr)
+    _logger.info("=== Web 控制台启动 ===")
     print()
     print("  自主赚钱系统 - 控制台")
     print("  http://127.0.0.1:7860")
     print()
-    uvicorn.run(app, host="127.0.0.1", port=7860, log_level="warning")
+
+    def _graceful_shutdown(signum=None, frame=None):
+        """优雅关闭：停止 Worker 进程"""
+        print("[SHUTDOWN] 正在停止 Worker...")
+        _logger.info("优雅关闭：停止 Worker")
+        if _is_worker_alive():
+            _send_command({"action": "stop"})
+            try:
+                _worker_process.wait(timeout=5)
+            except Exception:
+                _worker_process.terminate()
+        _cleanup_dead_worker()
+
+    # 注册退出钩子
+    atexit.register(_graceful_shutdown)
+    try:
+        _signal.signal(_signal.SIGTERM, _graceful_shutdown)
+    except (OSError, ValueError):
+        pass  # Windows 可能不支持 SIGTERM handler
+
+    _ensure_gateway()
+
+    # Web Server 启动时清理遗留的僵尸 Worker（上次崩溃留下的）
+    if _kill_orphan_worker():
+        # 清空快照让前端从 0 开始，否则会显示已停止状态
+        try:
+            snap = _read_snapshot()
+            if snap:
+                snap["running"] = False
+                snap["status_text"] = "已停止"
+                snap["pid"] = 0
+                _atomic_write_snapshot(snap)
+        except Exception:
+            pass
+
+    try:
+        uvicorn.run(
+            app, host="127.0.0.1", port=7860, log_level="warning",
+            timeout_keep_alive=5,
+            limit_concurrency=50,
+        )
+    except KeyboardInterrupt:
+        print("\n[MAIN] 用户中断，退出")
+        _logger.info("用户中断，退出")
+        _graceful_shutdown()
+    except Exception as e:
+        import traceback
+        _logger.critical(f"uvicorn 异常退出: {e}\n{traceback.format_exc()}")
+        print(f"\n[MAIN] uvicorn 异常退出: {e}")
+        _graceful_shutdown()

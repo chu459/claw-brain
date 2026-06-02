@@ -9,9 +9,55 @@ venv/
 
 # 环境变量 (包含 API Key)
 .env
+.env.*
+!.env.example
+
+# 凭据和密钥
+.credentials/
 
 # 系统记忆 (用户私有数据)
 system_memory.json
+system_memory.example.json
+!system_memory.example.json
+
+# 向量数据库
+.vector_db/
+.vector_store/
+chroma_db/
+
+# 会话数据
+sessions/
+pipe/
+memory_t_*.json
+state_logs_t_*.json
+tasks.json
+
+# 日志
+logs/
+*.log
+
+# Playwright 测试录制
+.playwright-cli/
+
+# 状态日志
+state_logs.json
+
+# 输出和运行时产物
+outputs/
+downloads/
+.xianyu_orders/
+.xianyu_output/
+nul
+
+# 截图和调试文件
+*.png
+*.jpg
+*.jpeg
+*.pdf
+captcha_screenshot.*
+heal_screenshot.*
+page_screenshot.*
+preview.html
 
 # IDE
 .vscode/
@@ -25,5 +71,14 @@ Thumbs.db
 
 # 临时文件
 *.tmp
-*.log
-nul
+*.backup
+*.bak
+web_console.backup.py
+web_dashboard.py
+
+# WorkBuddy workspace
+.workbuddy/
+
+# 数据目录
+data/
+uploads/
