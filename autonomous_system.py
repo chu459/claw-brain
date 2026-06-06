@@ -26,6 +26,7 @@ import subprocess
 import sys
 import os
 import shutil
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -56,6 +57,121 @@ OPENCLAW_GATEWAY_URL = os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:
 OPENCLAW_NODE_DIR = os.environ.get("OPENCLAW_NODE_DIR", "")
 OPENCLAW_NODE_EXE = os.path.join(OPENCLAW_NODE_DIR, "node.exe") if OPENCLAW_NODE_DIR else shutil.which("node") or "node"
 OPENCLAW_MJS = os.path.join(OPENCLAW_NODE_DIR, "node_modules", "openclaw", "openclaw.mjs") if OPENCLAW_NODE_DIR else ""
+OPENCLAW_MIN_NODE = (22, 16, 0)
+
+
+def _parse_node_version(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", text or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _node_version(node_exe: str) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run(
+            [node_exe, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_node_version(result.stdout.strip())
+
+
+def _openclaw_mjs_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if OPENCLAW_MJS:
+        candidates.append(Path(OPENCLAW_MJS))
+
+    openclaw_bin = shutil.which("openclaw")
+    if openclaw_bin:
+        candidates.append(Path(openclaw_bin).resolve().parent / "node_modules" / "openclaw" / "openclaw.mjs")
+
+    roots = [
+        Path.home() / ".workbuddy" / "binaries" / "node" / "versions",
+        Path(r"C:\ProgramData\WorkBuddy\chromium-env"),
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            candidates.extend(root.glob("**/node_modules/openclaw/openclaw.mjs"))
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved).lower()
+        if key not in seen and resolved.is_file():
+            seen.add(key)
+            existing.append(resolved)
+    return existing
+
+
+def _node_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if OPENCLAW_NODE_DIR:
+        candidates.append(Path(OPENCLAW_NODE_DIR) / "node.exe")
+
+    current_node = shutil.which("node")
+    if current_node:
+        candidates.append(Path(current_node))
+
+    roots = [
+        Path.home() / ".workbuddy" / "binaries" / "node" / "versions",
+        Path(r"C:\ProgramData\WorkBuddy\chromium-env"),
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            candidates.extend(root.glob("**/node.exe"))
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved).lower()
+        if key not in seen and resolved.is_file():
+            seen.add(key)
+            existing.append(resolved)
+    return existing
+
+
+def _find_compatible_node() -> Path | None:
+    usable: list[tuple[tuple[int, int, int], Path]] = []
+    for node in _node_candidates():
+        version = _node_version(str(node))
+        if version and version >= OPENCLAW_MIN_NODE:
+            usable.append((version, node))
+    if not usable:
+        return None
+    usable.sort(key=lambda item: item[0], reverse=True)
+    return usable[0][1]
+
+
+def _build_direct_openclaw_cmd() -> list[str] | None:
+    node = _find_compatible_node()
+    mjs_candidates = _openclaw_mjs_candidates()
+    if not node or not mjs_candidates:
+        return None
+    return [str(node), str(mjs_candidates[0])]
 
 # --- 系统行为配置 ---
 # 多目标模板（用户可在 Web 控制台切换）
@@ -108,11 +224,17 @@ class OpenClawClient:
         self.session_key = session_key
         self.gateway_url = gateway_url
         self._use_npx = False
+        self._node_dir = ""
 
-        # 确定执行方式：直接 openclaw 命令 / openclaw.mjs / npx openclaw
-        if OPENCLAW_MJS and os.path.isfile(OPENCLAW_MJS):
-            # 用户指定了 OPENCLAW_NODE_DIR 且 openclaw.mjs 存在
+        # 优先用可兼容的 Node 直接运行 openclaw.mjs，避免 PATH 里旧 Node 抢先。
+        direct_cmd = _build_direct_openclaw_cmd()
+        if direct_cmd:
+            self._node_exe = direct_cmd[0]
+            self._node_dir = str(Path(self._node_exe).parent)
+            self._openclaw_cmd = direct_cmd
+        elif OPENCLAW_MJS and os.path.isfile(OPENCLAW_MJS):
             self._node_exe = OPENCLAW_NODE_EXE
+            self._node_dir = str(Path(self._node_exe).parent)
             self._openclaw_cmd = [OPENCLAW_NODE_EXE, OPENCLAW_MJS]
         elif shutil.which("openclaw"):
             # 系统 PATH 中有 openclaw 命令
@@ -148,10 +270,14 @@ class OpenClawClient:
         """构建环境: 清除 NODE_OPTIONS，加入 Python 路径，设置浏览器下载目录"""
         env = os.environ.copy()
         env.pop("NODE_OPTIONS", None)
-        if OPENCLAW_NODE_DIR:
+        # OpenClaw 的本地配置已经知道 Gateway。把这个变量传进去会被当成外部网关覆盖，
+        # 反而要求额外 token/password，导致 agent 执行失败。
+        env.pop("OPENCLAW_GATEWAY_URL", None)
+        node_dir = self._node_dir or OPENCLAW_NODE_DIR
+        if node_dir:
             env.pop("NODE_PATH", None)
             # 统一用反斜杠比较，避免正斜杠/反斜杠不匹配
-            norm_dir = OPENCLAW_NODE_DIR.replace("/", "\\")
+            norm_dir = node_dir.replace("/", "\\")
             path_parts = env.get("PATH", "").split(os.pathsep)
             path_parts = [p for p in path_parts
                           if "node" not in p.lower() or norm_dir in p.replace("/", "\\")]
@@ -345,8 +471,37 @@ class Brain:
 
 ## 任务目标
 {context['goal']}
+
+最高优先级规则：
+- 本次任务目标必须覆盖默认模板、历史记忆、系统名称和旧策略。
+- 如果本次目标是测试、修复、整理、归档或评估，就只做本次目标，不要自动跳回赚钱、获客、卖货。
+- 只有当用户明确要求赚钱、获客、卖货时，才进入商业验证路径。
+"""
+        task_contract = context.get("task_contract", "")
+        if task_contract:
+            prompt += f"""
+## 任务目标契约
+{task_contract}
 """
         # 楚可能直接给反馈而非任务——Brain自己判断
+        decision_contract = context.get("decision_contract", "")
+        if decision_contract:
+            prompt += f"""
+## 自主决策合同
+{decision_contract}
+"""
+        checkpoint_context = context.get("checkpoint_context", "")
+        if checkpoint_context:
+            prompt += f"""
+## 主循环检查点
+{checkpoint_context}
+"""
+        supervisor_context = context.get("supervisor_context", "")
+        if supervisor_context:
+            prompt += f"""
+## 分段监督者
+{supervisor_context}
+"""
         goal = context.get('goal', '')
 
         # 继续任务：让Brain自己理解延续关系，而不是用规则锁死
@@ -989,6 +1144,20 @@ class AutonomousSystem:
             OPENCLAW_AGENT, SESSION_KEY, OPENCLAW_GATEWAY_URL
         )
         self.output_manager = OutputManager(OUTPUT_DIR)
+        try:
+            from cycle_checkpoint import create_checkpoint_journal
+            self.checkpoints = create_checkpoint_journal(Path(__file__).parent / "data" / "checkpoints", SESSION_KEY)
+        except Exception:
+            self.checkpoints = None
+        try:
+            from task_contract import create_task_contract
+            self.task_contract = create_task_contract(
+                Path(__file__).parent / "data" / "task_contracts",
+                SESSION_KEY,
+                ULTIMATE_GOAL,
+            )
+        except Exception:
+            self.task_contract = None
         self.loop_count = 0
         self.current_goal = ULTIMATE_GOAL  # 当前目标（可被覆盖）
 
@@ -1066,6 +1235,22 @@ class AutonomousSystem:
                 "history_summary": self.memory.get_summary(3),
                 "loop_count": self.loop_count,
             }
+            if self.task_contract:
+                context["task_contract"] = self.task_contract.build_prompt_context()
+            try:
+                from decision_contract import build_decision_contract_context
+                context["decision_contract"] = build_decision_contract_context(
+                    ULTIMATE_GOAL,
+                    last_feedback,
+                    self.loop_count,
+                )
+            except Exception:
+                pass
+            if self.checkpoints:
+                context["checkpoint_context"] = self.checkpoints.build_prompt_context(
+                    ULTIMATE_GOAL,
+                    self.loop_count,
+                )
             decision = self.brain.think(context)
 
             print(f"  思考: {decision.get('thought', '无')}")
@@ -1094,6 +1279,24 @@ class AutonomousSystem:
                 time.sleep(LOOP_INTERVAL)
                 continue
 
+            try:
+                from decision_contract import assess_action_risk
+                risk = assess_action_risk(
+                    action=action,
+                    thought=decision.get("thought", ""),
+                    goal=ULTIMATE_GOAL,
+                    last_feedback=last_feedback,
+                )
+            except Exception:
+                risk = {"needs_user": False}
+
+            if risk.get("needs_user"):
+                print("\n[CONFIRM] " + risk.get("question", "这个动作需要你确认。"))
+                answer = input("允许执行？输入“允许执行”继续：").strip()
+                if "允许执行" not in answer:
+                    last_feedback = "用户未确认高风险动作，必须换成只读验证或先解释。"
+                    continue
+
             print(f"\n[OpenClaw] 发送: {action}")
             result = self.openclaw.execute(action)
 
@@ -1107,6 +1310,19 @@ class AutonomousSystem:
                 print(f"  [FAIL] {content[:300]}")
 
             self.memory.add_action(action, content, success)
+            if self.checkpoints:
+                try:
+                    self.checkpoints.record(
+                        goal=ULTIMATE_GOAL,
+                        loop_count=self.loop_count,
+                        action=action,
+                        result=content,
+                        success=success,
+                        thought=decision.get("thought", ""),
+                        status=status,
+                    )
+                except Exception as exc:
+                    print(f"  [CHECKPOINT] 记录失败: {exc}")
 
             last_feedback = content if success else f"失败: {content}"
 

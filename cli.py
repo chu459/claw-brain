@@ -332,13 +332,19 @@ def start(
             brain_base_url=cfg["BRAIN_BASE_URL"],
             gateway_url=cfg["OPENCLAW_GATEWAY_URL"],
         )
-    failed = [r for r in results if not r[1]]
+    optional_checks = {"Vector Memory"}
+    failed = [r for r in results if not r[1] and r[0] not in optional_checks]
+    warnings = [r for r in results if not r[1] and r[0] in optional_checks]
     if failed:
         console.print("[red]Health check failed:[/red]")
         for name, _, msg in failed:
             console.print(f"  [red]x[/red] {name}: {msg}")
         console.print("\nFix the issues above or run [bold]doctor[/bold] for details.")
         raise typer.Exit(1)
+    if warnings:
+        console.print("[yellow]Non-blocking warnings:[/yellow]")
+        for name, _, msg in warnings:
+            console.print(f"  [yellow]![/yellow] {name}: {msg}")
 
     console.print(Panel(
         f"[bold]Goal:[/bold] {goal}\n"
@@ -350,6 +356,8 @@ def start(
     ))
 
     _state = SystemState()
+    with _state.lock:
+        _state.running = True
     config = RunLoopConfig(
         goal=goal, agent=agent, max_loops=max_loops, interval=interval,
         brain_api_key=cfg["BRAIN_API_KEY"],
@@ -435,6 +443,113 @@ def web(
     import uvicorn
     from web_console import app as web_app
     uvicorn.run(web_app, host=host, port=port, log_level="warning")
+
+
+# ===================== checkpoints =====================
+
+@app.command()
+def checkpoints(
+    session: str = typer.Option("", "--session", "-s", help="Session id, default uses newest checkpoint file"),
+    limit: int = typer.Option(8, "--limit", "-n", help="Rows to show"),
+    review: bool = typer.Option(False, "--review", help="Show supervisor review"),
+):
+    """Show recent main-loop checkpoints."""
+    import json
+
+    data_dir = Path(__file__).parent / "data" / "checkpoints"
+    if not data_dir.exists():
+        console.print("[dim]No checkpoints yet.[/dim]")
+        return
+
+    if session:
+        path = data_dir / f"{session}.jsonl"
+    else:
+        files = sorted(data_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            console.print("[dim]No checkpoints yet.[/dim]")
+            return
+        path = files[0]
+
+    if not path.exists():
+        console.print(f"[red]Checkpoint file not found:[/red] {path.name}")
+        return
+
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    table = Table(title=f"Checkpoints: {path.stem}", box=box.SIMPLE)
+    table.add_column("Round", style="bold")
+    table.add_column("Phase")
+    table.add_column("Quality")
+    table.add_column("Evidence")
+    table.add_column("Next")
+    table.add_column("Action", max_width=50)
+
+    for row in rows:
+        quality = row.get("quality", "")
+        style = {
+            "good": "green",
+            "weak": "yellow",
+            "bad": "red",
+            "needs_user": "cyan",
+        }.get(quality, "dim")
+        table.add_row(
+            str(row.get("loop_count", "")),
+            row.get("phase", ""),
+            f"[{style}]{quality}[/{style}]",
+            row.get("evidence_type", ""),
+            row.get("next_decision", ""),
+            (row.get("minimal_action", "") or "")[:80],
+        )
+
+    console.print(table)
+
+    if review:
+        from checkpoint_supervisor import review_checkpoints
+        result = review_checkpoints(rows)
+        console.print()
+        console.print(Panel(
+            f"[bold]Decision:[/bold] {result.decision}\n"
+            f"[bold]Severity:[/bold] {result.severity}\n"
+            f"[bold]Reason:[/bold] {result.reason}\n\n"
+            + "\n".join(f"- {item}" for item in result.suggestions),
+            title="[bold]Supervisor Review[/bold]",
+            border_style="cyan" if result.severity != "high" else "red",
+        ))
+
+
+# ===================== task contract =====================
+
+@app.command()
+def task_contract(
+    session: str = typer.Option("", "--session", "-s", help="Session id, default uses latest contract"),
+):
+    """Show the saved task contract."""
+    from task_contract import read_task_contract
+
+    data_dir = Path(__file__).parent / "data" / "task_contracts"
+    data = read_task_contract(data_dir, session_id=session)
+    if not data:
+        console.print("[dim]No task contract yet.[/dim]")
+        return
+
+    table = Table(title=f"Task Contract: {data.get('session_id', '')}", box=box.SIMPLE)
+    table.add_column("Field", style="bold")
+    table.add_column("Value", max_width=80)
+    table.add_row("Goal", data.get("goal_summary", ""))
+    table.add_row("Phase", data.get("phase", ""))
+    table.add_row("Minimum Validation", data.get("minimum_validation", ""))
+    table.add_row("Expected Evidence", " / ".join(data.get("expected_evidence", [])))
+    table.add_row("Checkpoint Policy", data.get("checkpoint_policy", ""))
+    table.add_row("Tool Policy", data.get("tool_policy", ""))
+    table.add_row("Risk Policy", data.get("user_risk_policy", ""))
+    table.add_row("Created", data.get("created_at", ""))
+    console.print(table)
 
 
 # ===================== xianyu (闲鱼服务) =====================

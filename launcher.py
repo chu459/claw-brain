@@ -9,10 +9,12 @@ import os
 import webbrowser
 import socket
 import threading
+import shutil
+from pathlib import Path
 
 USERPROFILE = os.environ.get("USERPROFILE", "")
-PYTHON = os.path.join(USERPROFILE, ".workbuddy", "binaries", "python", "versions", "3.13.12", "python.exe")
-PROJECT_DIR = os.path.join(USERPROFILE, "WorkBuddy", "2026-05-15-task-28")
+PROJECT_DIR = str(Path(__file__).resolve().parent)
+PYTHON = sys.executable
 GW_SCRIPT = os.path.join(USERPROFILE, ".openclaw", "start-gateway.cmd")
 WEB_SCRIPT = os.path.join(PROJECT_DIR, "web_console.py")
 GW_PORT = 18789
@@ -66,9 +68,21 @@ def start_gateway():
     env["NO_PROXY"] = "localhost,127.0.0.1,::1"
     env["NODE_OPTIONS"] = ""
 
+    if os.path.isfile(GW_SCRIPT):
+        cmd = ["cmd.exe", "/c", GW_SCRIPT]
+        cwd = os.path.dirname(GW_SCRIPT)
+    elif shutil.which("openclaw"):
+        cmd = [shutil.which("openclaw"), "gateway", "run", "--force"]
+        cwd = PROJECT_DIR
+    elif shutil.which("npx"):
+        cmd = [shutil.which("npx"), "openclaw", "gateway", "run", "--force"]
+        cwd = PROJECT_DIR
+    else:
+        return False
+
     subprocess.Popen(
-        ["cmd.exe", "/c", GW_SCRIPT],
-        cwd=os.path.dirname(GW_SCRIPT),
+        cmd,
+        cwd=cwd,
         env=env,
         creationflags=0x08000000  # CREATE_NO_WINDOW
     )

@@ -41,10 +41,12 @@ logs/
 
 # 状态日志
 state_logs.json
+state_logs_*.json
 
 # 输出和运行时产物
 outputs/
 downloads/
+exports/
 .xianyu_orders/
 .xianyu_output/
 nul

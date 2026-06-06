@@ -591,7 +591,14 @@ class VectorMemory:
         """获取记忆统计信息"""
         col = self._get_collection()
         if col is None:
-            return {"total": 0, "fallback": True}
+            return {
+                "total": 0,
+                "fallback": True,
+                "api_available": self._embedding_client.is_available(),
+                "db_dir": self.db_dir,
+                "available": False,
+                "error": "vector store unavailable",
+            }
 
         try:
             count = col.count()
@@ -600,9 +607,17 @@ class VectorMemory:
                 "fallback": self._fallback_mode,
                 "api_available": self._embedding_client.is_available(),
                 "db_dir": self.db_dir,
+                "available": True,
             }
         except Exception as e:
-            return {"total": 0, "error": str(e)}
+            return {
+                "total": 0,
+                "fallback": self._fallback_mode,
+                "api_available": self._embedding_client.is_available(),
+                "db_dir": self.db_dir,
+                "available": False,
+                "error": str(e),
+            }
 
     def cleanup_old_memories(self, max_age_days: int = 90) -> int:
         """

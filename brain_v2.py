@@ -45,6 +45,13 @@ class BrainV2Context:
         parts: list[str] = []
 
         try:
+            from decision_contract import build_decision_contract_context
+            parts.append("[DecisionContract]")
+            parts.append(build_decision_contract_context(goal, last_feedback, loop_count))
+        except Exception:
+            pass
+
+        try:
             cycle = self.soul.get_current_cycle()
             parts.append("[Soul]")
             parts.append(self.soul.get_cycle_description(cycle))

@@ -23,10 +23,19 @@ PYTHON = r"C:\Users\楚\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 NODE = r"C:\Users\楚\.workbuddy\binaries\node\versions\22.16.0\node.exe"
 OPENCLAW_JS = r"C:\Users\楚\.workbuddy\binaries\node\versions\22.16.0\node_modules\openclaw\dist\index.js"
 
+from pathlib import Path as _Path
+import shutil as _shutil
+
+# 覆盖旧项目路径，确保从当前 claw-brain-latest 启动。
+PROJECT_DIR = str(_Path(__file__).resolve().parent)
+PYTHON = sys.executable
+NODE = _shutil.which("node") or NODE
+OPENCLAW_JS = os.environ.get("OPENCLAW_JS", OPENCLAW_JS if os.path.isfile(OPENCLAW_JS) else "")
+
 # AutoDL
 INSTANCE_UUID = "pro-77977e96aa06"
 API_BASE = "https://api.autodl.com"
-API_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjEwMjI4NTgsInV1aWQiOiI2NjBjNTgzZGIwY2VmNmNjIiwidGVuYW50IjoiYXV0b2RsIiwiYXVkIjoiZGV2ZWxvcF9hcGkifQ.rFSVQHb94YabEbfCWbfId1dsq5uv0vLN7PdG6RlWWUSmRFNUeJPvusimE79DITsMSi_kIk1pt2_ova-qd3_sRA"
+API_TOKEN = os.environ.get("AUTODL_API_TOKEN", "")
 
 # 端口
 TUNNEL_PORT = 8001
@@ -51,6 +60,8 @@ def log(msg):
 
 
 def api_post(path, data):
+    if not API_TOKEN:
+        raise RuntimeError("AUTODL_API_TOKEN 未设置，无法调用 AutoDL API")
     body = json.dumps(data).encode()
     req = urllib.request.Request(
         f"{API_BASE}{path}", data=body,
@@ -183,6 +194,43 @@ def start_gateway():
     _procs.append(("gateway", proc))
 
     for i in range(20):
+        time.sleep(1)
+        if port_ok(GW_PORT):
+            log("OpenClaw 网关已就绪")
+            return True
+    log("[WARN] 网关启动超时")
+    return False
+
+
+def _openclaw_gateway_command():
+    openclaw = _shutil.which("openclaw")
+    if openclaw:
+        return [openclaw, "gateway", "run", "--force"]
+    npx = _shutil.which("npx")
+    if npx:
+        return [npx, "openclaw", "gateway", "run", "--force"]
+    if OPENCLAW_JS and os.path.isfile(OPENCLAW_JS) and NODE:
+        return [NODE, OPENCLAW_JS, "gateway", "--port", str(GW_PORT)]
+    return None
+
+
+def start_gateway():
+    log("启动 OpenClaw 网关...")
+    cmd = _openclaw_gateway_command()
+    if not cmd:
+        log("[ERROR] 未找到 openclaw/npx，也没有可用 OPENCLAW_JS")
+        return False
+
+    env = os.environ.copy()
+    env["HTTP_PROXY"] = "http://127.0.0.1:17890"
+    env["HTTPS_PROXY"] = "http://127.0.0.1:17890"
+    env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    env["NODE_OPTIONS"] = ""
+
+    proc = subprocess.Popen(cmd, cwd=PROJECT_DIR, env=env)
+    _procs.append(("gateway", proc))
+
+    for _ in range(20):
         time.sleep(1)
         if port_ok(GW_PORT):
             log("OpenClaw 网关已就绪")

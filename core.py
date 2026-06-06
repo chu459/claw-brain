@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from autonomous_system import Brain, Memory, OpenClawClient
+from checkpoint_supervisor import build_supervisor_context, review_checkpoints
+from cycle_checkpoint import create_checkpoint_journal
+from decision_contract import assess_action_risk, build_decision_contract_context
+from task_contract import create_task_contract
 
 # Windows 终端默认 gbk 编码，Brain 返回的 emoji/中文会导致 print() 崩溃
 # 这会被 except 当成 Brain API 调用失败→触发熔断。强制 utf-8 一劳永逸。
@@ -478,6 +482,19 @@ def _try_smart_answer(answer: str, question: str) -> str:
             return f"{answer}（系统已自动从凭据库获取：{cred_info}）"
 
     return answer
+
+
+def _shrink_overpacked_action(action: str, goal: str = "") -> tuple[str, str]:
+    """把明显塞了太多步骤的测试动作压小，避免 OpenClaw 长时间卡住。"""
+    text = f"{goal}\n{action}".lower()
+    if "about:blank" in text:
+        risky_parts = ("截图", "screenshot", "等待", "wait", "提取", "extract", "保存", "save")
+        if any(part in text for part in risky_parts):
+            return (
+                "打开 about:blank，并只报告页面标题。不要截图，不要等待，不要做其他操作。",
+                "about:blank 测试动作过大，已压成单步只读动作。",
+            )
+    return action, ""
 
 
 def _quality_review(
@@ -1062,6 +1079,15 @@ def run_loop(
     _dbg("run_loop: start")
     mem = Memory(config.memory_file)
     _dbg("run_loop: Memory init ok")
+    checkpoint_journal = create_checkpoint_journal(
+        Path(__file__).parent / "data" / "checkpoints",
+        session_id=getattr(state, "task_id", config.session_key),
+    )
+    task_contract = create_task_contract(
+        Path(__file__).parent / "data" / "task_contracts",
+        session_id=getattr(state, "task_id", config.session_key),
+        goal=goal,
+    )
     brain = Brain(config.brain_api_key, config.brain_base_url, config.brain_model)
     _dbg(f"run_loop: Brain init ok, model={config.brain_model}")
     try:
@@ -1341,6 +1367,8 @@ def run_loop(
             print(f"[LOOP] Round {lc} - 行动摘要构建失败: {e}")
 
         # === 构建 context（所有字段都已安全降级） ===
+        recent_checkpoints = checkpoint_journal.recent(limit=5)
+        supervisor_context = build_supervisor_context(recent_checkpoints)
         try:
             ctx = {
                 "goal": goal,
@@ -1356,6 +1384,10 @@ def run_loop(
                 "artifacts_summary": _get_artifacts_summary(output_manager=getattr(config, 'output_manager', None)),
                 "failure_cases": failure_cases_context,
                 "action_history": action_history_summary,
+                "task_contract": task_contract.build_prompt_context(),
+                "decision_contract": build_decision_contract_context(goal, last_fb, lc),
+                "checkpoint_context": checkpoint_journal.build_prompt_context(goal, lc),
+                "supervisor_context": supervisor_context,
             }
         except Exception as e:
             print(f"[LOOP] Round {lc} - context 构建失败: {e}")
@@ -1364,6 +1396,10 @@ def run_loop(
                 "knowledge_base": "", "wiki_summary": "",
                 "last_feedback": last_fb, "loop_count": lc,
                 "credentials": "", "current_date": str(datetime.now()),
+                "task_contract": task_contract.build_prompt_context(),
+                "decision_contract": build_decision_contract_context(goal, last_fb, lc),
+                "checkpoint_context": checkpoint_journal.build_prompt_context(goal, lc),
+                "supervisor_context": supervisor_context,
             }
 
         # === 检查用户中途注入的消息 ===
@@ -1450,6 +1486,33 @@ def run_loop(
         action = dec.get("action_to_openclaw", "").strip()
         upd = dec.get("update_memory", "")
         st = dec.get("status", "continue")
+        if action:
+            action, shrink_note = _shrink_overpacked_action(action, goal)
+            if shrink_note:
+                dec["action_to_openclaw"] = action
+                observation = (observation + "\n" if observation else "") + f"[动作压缩] {shrink_note}"
+                print(f"[LOOP] Round {lc} - action shrunk: {action}")
+
+        if action:
+            try:
+                action_risk = assess_action_risk(
+                    action=action,
+                    thought=thought,
+                    goal=goal,
+                    last_feedback=last_fb,
+                )
+            except Exception as e:
+                print(f"[LOOP] Round {lc} - action risk check failed (non-fatal): {e}")
+                action_risk = {"needs_user": False}
+
+            if action_risk.get("needs_user"):
+                st = "need_input"
+                dec["status"] = "need_input"
+                dec["question_for_user"] = action_risk.get("question", "这个动作需要你确认后再执行。是否允许执行？")
+                dec["approval_required"] = True
+                observation = (observation + "\n" if observation else "") + f"[执行前确认] {action_risk.get('reason', '')}"
+                print(f"[LOOP] Round {lc} - action requires approval: {action[:80]}")
+                _emit("status", f"Round {lc} - 高风险动作需要确认")
 
         # 补全训练数据：如果上轮有用户消息，把Brain的反思也记入训练数据
         if state.injected_feedback == "" and last_fb and "[用户消息]" in (last_fb or ""):
@@ -1480,12 +1543,24 @@ def run_loop(
         if st == "need_input":
             question = dec.get("question_for_user", thought) or "System needs your input"
             print(f"[LOOP] Round {lc} - need_input: {question}")
+            try:
+                checkpoint_journal.record(
+                    goal=goal,
+                    loop_count=lc,
+                    action=action or "need_input",
+                    result=question,
+                    success=False,
+                    thought=thought,
+                    status="need_input",
+                )
+            except Exception as e:
+                print(f"[CHECKPOINT] need_input record failed: {e}")
 
             # 如果 Brain 给了有效的 action 且不是纯等待指令，先执行 action
             # 例如"输入手机号18817378624，等待验证码"——应先执行输入手机号
             _WAIT_ONLY_KEYWORDS = ["无需执行", "等待", "暂停", "不需要操作"]
             is_wait_only = any(kw in action for kw in _WAIT_ONLY_KEYWORDS)
-            if action and not is_wait_only:
+            if action and not is_wait_only and not dec.get("approval_required"):
                 print(f"[LOOP] Round {lc} - need_input 但有可执行action，先执行: {action[:60]}...")
                 _emit("status", f"Round {lc} - OpenClaw executing... (等待浏览器锁)")
                 with CLAW_GLOBAL_LOCK:
@@ -1730,6 +1805,23 @@ def run_loop(
             "instruction": action,
             "result": result["content"], "success": result["success"],
         })
+        try:
+            checkpoint = checkpoint_journal.record(
+                goal=goal,
+                loop_count=lc,
+                action=action,
+                result=result["content"],
+                success=result["success"],
+                thought=thought,
+                status=st,
+            )
+            print(
+                f"[CHECKPOINT] R{lc} phase={checkpoint.phase} "
+                f"evidence={checkpoint.evidence_type} quality={checkpoint.quality} "
+                f"next={checkpoint.next_decision}"
+            )
+        except Exception as e:
+            print(f"[CHECKPOINT] record failed: {e}")
 
         # 记录 action 指纹 + 失败类型
         _action_fingerprint = action.strip()[:80]
@@ -1927,7 +2019,15 @@ def run_health_check(
         from vector_memory import get_vector_memory
         vm = get_vector_memory()
         vm_stats = vm.get_stats()
-        results.append(("Vector Memory", True, f"{vm_stats['total']} memories, api={'ok' if vm_stats['api_available'] else 'no key'}"))
+        vm_available = vm_stats.get("available", True)
+        vm_detail = (
+            f"{vm_stats.get('total', 0)} memories, "
+            f"api={'ok' if vm_stats.get('api_available') else 'no key'}, "
+            f"fallback={vm_stats.get('fallback', False)}"
+        )
+        if vm_stats.get("error"):
+            vm_detail += f", {vm_stats.get('error')}"
+        results.append(("Vector Memory", vm_available, vm_detail))
     except Exception as e:
         results.append(("Vector Memory", False, str(e)[:80]))
 

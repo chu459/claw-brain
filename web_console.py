@@ -47,6 +47,8 @@ from credential_store import (
     delete_account, get_credential_value, ACCOUNT_TEMPLATES, PRESET_FIELDS,
 )
 from core import SystemState, RunLoopConfig, run_loop as _core_run_loop, SessionManager
+from checkpoint_supervisor import review_checkpoints
+from task_contract import read_task_contract
 from task_manager import get_task_manager, TaskManager
 
 # ===================== 配置 =====================
@@ -114,6 +116,36 @@ def _send_command(cmd: dict):
     tmp = COMMAND_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")
     tmp.replace(COMMAND_FILE)
+
+
+def _latest_checkpoint_payload(limit: int = 5) -> dict:
+    data_dir = Path(__file__).parent / "data" / "checkpoints"
+    if not data_dir.exists():
+        rows = []
+        session = ""
+    else:
+        files = sorted(data_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        path = files[0] if files else None
+        session = path.stem if path else ""
+        rows = []
+        if path and path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+                    if line.strip():
+                        rows.append(json.loads(line))
+            except Exception:
+                rows = []
+    return {
+        "session": session,
+        "items": rows,
+        "review": review_checkpoints(rows).to_dict(),
+    }
+
+
+def _latest_task_contract_payload(session: str = "") -> dict:
+    data_dir = Path(__file__).parent / "data" / "task_contracts"
+    data = read_task_contract(data_dir, session_id=session)
+    return data or {}
 
 
 def _pid_exists(pid: int) -> bool:
@@ -2045,6 +2077,8 @@ def api_state(task_id: str = ""):
                 "tasks": [],
                 "last_activity_time": LAST_ACTIVITY_TIME,
                 "idle_timeout": IDLE_TIMEOUT_SECONDS,
+                "checkpoints": _latest_checkpoint_payload(),
+                "task_contract": _latest_task_contract_payload(last_sess.get("task_id", "") or last_sess.get("session_id", "")),
             })
 
         return JSONResponse({
@@ -2063,6 +2097,8 @@ def api_state(task_id: str = ""):
             "tasks": [],
             "last_activity_time": LAST_ACTIVITY_TIME,
             "idle_timeout": IDLE_TIMEOUT_SECONDS,
+            "checkpoints": _latest_checkpoint_payload(),
+            "task_contract": _latest_task_contract_payload(),
         })
 
     is_alive = _is_worker_alive()
@@ -2097,7 +2133,55 @@ def api_state(task_id: str = ""):
         }],
         "last_activity_time": LAST_ACTIVITY_TIME,
         "idle_timeout": IDLE_TIMEOUT_SECONDS,
+        "checkpoints": _latest_checkpoint_payload(),
+        "task_contract": _latest_task_contract_payload(snap.get("task_id", "") or snap.get("session_id", "")),
     })
+
+
+@app.get("/api/checkpoints")
+def api_checkpoints(session: str = "", limit: int = 8):
+    _touch_activity()
+    data_dir = Path(__file__).parent / "data" / "checkpoints"
+    if not data_dir.exists():
+        return JSONResponse({
+            "session": session,
+            "items": [],
+            "review": review_checkpoints([]).to_dict(),
+        })
+
+    if session:
+        path = data_dir / f"{session}.jsonl"
+    else:
+        files = sorted(data_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        path = files[0] if files else None
+
+    if not path or not path.exists():
+        return JSONResponse({
+            "session": session,
+            "items": [],
+            "review": review_checkpoints([]).to_dict(),
+        })
+
+    rows = []
+    try:
+        safe_limit = max(1, min(limit, 50))
+        for line in path.read_text(encoding="utf-8").splitlines()[-safe_limit:]:
+            if line.strip():
+                rows.append(json.loads(line))
+    except Exception:
+        rows = []
+
+    return JSONResponse({
+        "session": path.stem,
+        "items": rows,
+        "review": review_checkpoints(rows).to_dict(),
+    })
+
+
+@app.get("/api/task-contract")
+def api_task_contract(session: str = ""):
+    _touch_activity()
+    return JSONResponse(_latest_task_contract_payload(session=session))
 
 
 @app.get("/api/output/{output_id}")

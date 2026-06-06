@@ -27,6 +27,33 @@ It's an autonomous decision engine running a self-correcting loop:
 Think → Decide → Act → Observe → Think again
 ```
 
+Current product core:
+
+```
+Goal -> smallest useful action -> evidence -> judgment -> next decision
+```
+
+At the start of each run, the system writes a task contract: target, phase,
+minimum validation rule, expected evidence, tool policy, and risk boundary.
+This keeps the agent focused before it starts acting.
+
+The system keeps checkpoint logs for this loop. After each action it records
+what was attempted, what evidence came back, whether that evidence is strong,
+and whether the next step should continue, verify, change method, or wait for
+the user.
+
+Inspect recent checkpoints:
+
+```bash
+python cli.py checkpoints
+```
+
+Inspect the current task contract:
+
+```bash
+python cli.py task-contract
+```
+
 ### Architecture
 
 ```

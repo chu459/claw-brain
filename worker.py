@@ -326,6 +326,7 @@ def run_worker(goal: str, agent: str, max_loops: int, interval: int,
             brain_api_key=brain_api_key, brain_base_url=brain_base_url,
             brain_model=brain_model, gateway_url=gateway_url,
             session_key=session_key, memory_file=memory_file,
+            use_vector_memory=False,
             output_manager=OutputManager(OUTPUT_DIR),
         )
         run_loop(state, config, on_input_needed=on_input_needed, on_event=_on_event)
