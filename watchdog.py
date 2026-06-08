@@ -17,6 +17,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from gateway_runtime import gateway_command as resolve_gateway_command
+from gateway_runtime import gateway_env as build_gateway_env
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PYTHON = sys.executable
@@ -82,13 +85,7 @@ def kill_port_users(port: int) -> None:
 
 
 def gateway_command() -> list[str] | None:
-    openclaw = shutil.which("openclaw")
-    if openclaw:
-        return [openclaw, "gateway", "run", "--force"]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "openclaw", "gateway", "run", "--force"]
-    return None
+    return resolve_gateway_command()
 
 
 def ensure_gateway(max_wait: int = 20) -> bool:
@@ -101,9 +98,7 @@ def ensure_gateway(max_wait: int = 20) -> bool:
         log("[WARN] openclaw/npx not found, skip gateway start")
         return False
 
-    env = os.environ.copy()
-    env["NODE_OPTIONS"] = ""
-    env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    env = build_gateway_env()
 
     log("Starting OpenClaw gateway...")
     subprocess.Popen(

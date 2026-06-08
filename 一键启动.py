@@ -25,6 +25,8 @@ OPENCLAW_JS = r"C:\Users\楚\.workbuddy\binaries\node\versions\22.16.0\node_modu
 
 from pathlib import Path as _Path
 import shutil as _shutil
+from gateway_runtime import gateway_command as _gateway_command
+from gateway_runtime import gateway_env as _gateway_env
 
 # 覆盖旧项目路径，确保从当前 claw-brain-latest 启动。
 PROJECT_DIR = str(_Path(__file__).resolve().parent)
@@ -203,12 +205,9 @@ def start_gateway():
 
 
 def _openclaw_gateway_command():
-    openclaw = _shutil.which("openclaw")
-    if openclaw:
-        return [openclaw, "gateway", "run", "--force"]
-    npx = _shutil.which("npx")
-    if npx:
-        return [npx, "openclaw", "gateway", "run", "--force"]
+    cmd = _gateway_command()
+    if cmd:
+        return cmd
     if OPENCLAW_JS and os.path.isfile(OPENCLAW_JS) and NODE:
         return [NODE, OPENCLAW_JS, "gateway", "--port", str(GW_PORT)]
     return None
@@ -221,7 +220,7 @@ def start_gateway():
         log("[ERROR] 未找到 openclaw/npx，也没有可用 OPENCLAW_JS")
         return False
 
-    env = os.environ.copy()
+    env = _gateway_env()
     env["HTTP_PROXY"] = "http://127.0.0.1:17890"
     env["HTTPS_PROXY"] = "http://127.0.0.1:17890"
     env["NO_PROXY"] = "localhost,127.0.0.1,::1"

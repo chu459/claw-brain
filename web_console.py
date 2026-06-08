@@ -41,6 +41,7 @@ if _env_file.exists():
 
 # 确保能导入核心模块
 sys.path.insert(0, str(Path(__file__).parent))
+from gateway_runtime import ensure_gateway as ensure_openclaw_gateway
 from autonomous_system import OpenClawClient, Brain, Memory, GOAL_TEMPLATES, OUTPUT_DIR, OutputManager
 from credential_store import (
     list_accounts, get_account, add_account, update_account,
@@ -2555,6 +2556,25 @@ class _StderrToLog:
         self._fallback.write(msg)
     def flush(self):
         self._fallback.flush()
+
+
+def _ensure_gateway(gateway_port: int = 18789, timeout: int = 20) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", gateway_port), timeout=1):
+            print(f"  [OK] OpenClaw gateway ready (:{gateway_port})")
+            return True
+    except OSError:
+        print(f"  [!] OpenClaw gateway offline (:{gateway_port}), trying auto-start...")
+
+    return ensure_openclaw_gateway(
+        Path(__file__).parent,
+        port=gateway_port,
+        max_wait=timeout,
+        log=print,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 if __name__ == "__main__":

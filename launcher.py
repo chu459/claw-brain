@@ -11,6 +11,7 @@ import socket
 import threading
 import shutil
 from pathlib import Path
+from gateway_runtime import ensure_gateway as ensure_openclaw_gateway
 
 USERPROFILE = os.environ.get("USERPROFILE", "")
 PROJECT_DIR = str(Path(__file__).resolve().parent)
@@ -59,39 +60,12 @@ def kill_port(port):
 
 
 def start_gateway():
-    if port_in_use(GW_PORT):
-        return True
-
-    env = os.environ.copy()
-    env["HTTP_PROXY"] = "http://127.0.0.1:17890"
-    env["HTTPS_PROXY"] = "http://127.0.0.1:17890"
-    env["NO_PROXY"] = "localhost,127.0.0.1,::1"
-    env["NODE_OPTIONS"] = ""
-
-    if os.path.isfile(GW_SCRIPT):
-        cmd = ["cmd.exe", "/c", GW_SCRIPT]
-        cwd = os.path.dirname(GW_SCRIPT)
-    elif shutil.which("openclaw"):
-        cmd = [shutil.which("openclaw"), "gateway", "run", "--force"]
-        cwd = PROJECT_DIR
-    elif shutil.which("npx"):
-        cmd = [shutil.which("npx"), "openclaw", "gateway", "run", "--force"]
-        cwd = PROJECT_DIR
-    else:
-        return False
-
-    subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        creationflags=0x08000000  # CREATE_NO_WINDOW
+    return ensure_openclaw_gateway(
+        PROJECT_DIR,
+        port=GW_PORT,
+        max_wait=30,
+        creationflags=0x08000000,  # CREATE_NO_WINDOW
     )
-
-    for _ in range(30):
-        time.sleep(1)
-        if port_in_use(GW_PORT):
-            return True
-    return False
 
 
 def start_web_console():
