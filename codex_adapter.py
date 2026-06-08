@@ -75,9 +75,9 @@ def codex_available() -> tuple[bool, str]:
 
 
 def build_codex_prompt(task: str) -> str:
-    return f"""你是 claw-brain 系统里的 Codex 工程执行层。
+    return f"""请立即执行下面任务，不要只回复“收到”“明白”或行为承诺。
 
-任务：
+当前必须完成的任务：
 {task}
 
 执行要求：
@@ -87,6 +87,9 @@ def build_codex_prompt(task: str) -> str:
 - 不启动长期前台服务。
 - 不改无关文件。
 - 不提交 git，除非任务明确要求。
+- 如果任务要求只读，就只读，不写文件。
+- 如果任务里指定了最终回复文本，最终必须按它回复。
+- 最终回答不能只说“我会做”，必须说明已经做了什么。
 - 最后用简短中文说明：做了什么、验证结果、还有什么风险。
 """
 
@@ -128,7 +131,7 @@ def run_codex_task(
         "--ephemeral",
         "--output-last-message",
         str(output_file),
-        prompt,
+        "-",
     ]
 
     env = os.environ.copy()
@@ -140,6 +143,7 @@ def run_codex_task(
             cmd,
             cwd=str(root),
             env=env,
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=timeout,

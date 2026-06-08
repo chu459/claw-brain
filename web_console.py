@@ -19,6 +19,7 @@ import socket
 import shutil
 import subprocess
 import uuid
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -41,6 +42,7 @@ if _env_file.exists():
 
 # 确保能导入核心模块
 sys.path.insert(0, str(Path(__file__).parent))
+from codex_adapter import codex_available
 from gateway_runtime import ensure_gateway as ensure_openclaw_gateway
 from autonomous_system import OpenClawClient, Brain, Memory, GOAL_TEMPLATES, OUTPUT_DIR, OutputManager
 from credential_store import (
@@ -1280,6 +1282,15 @@ function poll(){
 
     if(d.status.indexOf('思考')>=0){$('s-dot').className='dot dot-y';$('s-text').textContent=d.status;}
     else if(d.status.indexOf('运行')>=0){$('s-dot').className='dot dot-g';}
+    if(d.backends){
+      if(d.backends.codex && $('codex-dot')){
+        $('codex-dot').className='dot '+(d.backends.codex.ok?'dot-g':'dot-x');
+        $('codex-status').textContent=d.backends.codex.label;
+      }
+      if(d.backends.openclaw && $('gw-dot')){
+        $('gw-dot').className='dot '+(d.backends.openclaw.ok?'dot-g':'dot-x');
+      }
+    }
     // 智能滚动：如果用户之前在底部附近，自动滚到底；否则保持原位
     if(bb && bbDist<100){bb.scrollTop=bb.scrollHeight;}
     if(cb && cbDist<100){cb.scrollTop=cb.scrollHeight;}
@@ -1609,6 +1620,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Enter'&&chatOpen&&do
   <div class="card"><div class="card-label">系统状态</div>
     <div class="srow"><div class="dot dot-x" id="s-dot"></div><span class="label" id="s-text">待命中</span></div>
     <div class="srow"><div class="dot dot-g" id="brain-dot"></div><span class="label">AI 大脑</span><span class="val" id="brain-model">DeepSeek</span></div>
+    <div class="srow"><div class="dot dot-y" id="codex-dot"></div><span class="label">Codex 工程层</span><span class="val" id="codex-status">checking</span></div>
     <div class="srow"><div class="dot dot-g" id="gw-dot"></div><span class="label">小龙虾 Gateway</span><span class="val">:18789</span></div>
     <div id="task-bar" style="display:none;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
   </div>
@@ -2085,6 +2097,28 @@ async def api_chat(req: Request):
         })
 
 
+def _backend_status_payload() -> dict:
+    codex_ok, codex_info = codex_available()
+    gateway_ok = False
+    try:
+        req = urllib.request.urlopen(f"{OPENCLAW_GATEWAY_URL}/health", timeout=2)
+        gateway_ok = req.status == 200
+    except Exception:
+        gateway_ok = False
+    return {
+        "codex": {
+            "ok": codex_ok,
+            "label": "online" if codex_ok else "offline",
+            "info": codex_info[:120],
+        },
+        "openclaw": {
+            "ok": gateway_ok,
+            "label": "online" if gateway_ok else "offline",
+            "url": OPENCLAW_GATEWAY_URL,
+        },
+    }
+
+
 @app.get("/api/state")
 def api_state(task_id: str = ""):
     _touch_activity()
@@ -2113,6 +2147,7 @@ def api_state(task_id: str = ""):
                 "checkpoints": _latest_checkpoint_payload(),
                 "task_contract": _latest_task_contract_payload(last_sess.get("task_id", "") or last_sess.get("session_id", "")),
                 "messages": latest_message_payload(Path(__file__).parent),
+                "backends": _backend_status_payload(),
             })
 
         return JSONResponse({
@@ -2134,6 +2169,7 @@ def api_state(task_id: str = ""):
             "checkpoints": _latest_checkpoint_payload(),
             "task_contract": _latest_task_contract_payload(),
             "messages": latest_message_payload(Path(__file__).parent),
+            "backends": _backend_status_payload(),
         })
 
     is_alive = _is_worker_alive()
@@ -2171,6 +2207,7 @@ def api_state(task_id: str = ""):
         "checkpoints": _latest_checkpoint_payload(),
         "task_contract": _latest_task_contract_payload(snap.get("task_id", "") or snap.get("session_id", "")),
         "messages": latest_message_payload(Path(__file__).parent),
+        "backends": _backend_status_payload(),
     })
 
 

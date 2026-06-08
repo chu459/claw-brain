@@ -23,6 +23,7 @@
 - 网关仍不可用时，不影响 Codex 和本地命令任务。
 - 本地命令会拦截危险操作，如 `git reset --hard`、`Remove-Item`、`shutdown`。
 - Codex 以非交互方式运行，有超时、有日志，不阻塞整个系统。
+- Web 控制台会显示 Codex 和 OpenClaw 的在线状态。
 
 ## 智能性提升
 
@@ -35,3 +36,8 @@
 - Codex 是工程师。
 - OpenClaw 是外部操作员。
 - Local Command 是快速工具箱。
+
+## 已验证样例
+
+- `[LOCAL_CMD] python --version`：真实系统循环执行成功。
+- `[CODEX] Run this read-only command: Get-Content README.md -TotalCount 3...`：Codex 真实执行成功。
