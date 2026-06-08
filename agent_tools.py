@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from action_router import build_action_router_context, execute_routed_action
 from message_center import MessageCenter
 
 
@@ -52,6 +53,8 @@ def build_system_tools_context(project_root: str | Path) -> str:
         lines.append("web-access 模板已安装，可优先用于复杂网页任务。")
     if adapter_skill.exists():
         lines.append("opencli-adapter-author 模板已安装，可用于把网站能力沉淀成命令行适配器。")
+    lines.append("")
+    lines.append(build_action_router_context(root))
     return "\n".join(lines)
 
 
@@ -77,6 +80,14 @@ def handle_system_action(
     if text.startswith("[MEMORY_SEARCH]"):
         query = text[len("[MEMORY_SEARCH]"):].strip()
         return _handle_memory_search(query, Path(project_root))
+    if text.startswith("[CODEX]") or text.startswith("[LOCAL_CMD]") or text.startswith("[SHELL]") or text.startswith("[RUN_CMD]"):
+        result = execute_routed_action(
+            text,
+            project_root=project_root,
+            claw=claw,
+            timeout=180,
+        )
+        return SystemActionResult(True, bool(result.get("success")), str(result.get("content", "")), str(result.get("route", "router")))
 
     return SystemActionResult(
         True,
@@ -275,4 +286,3 @@ def _get_openclaw_cmd(project_root: Path) -> list[str]:
     if npx:
         return [npx, "openclaw"]
     return ["openclaw"]
-

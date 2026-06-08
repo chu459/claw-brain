@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from autonomous_system import Brain, Memory, OpenClawClient
+from action_router import classify_action, execute_routed_action
 from agent_tools import build_system_tools_context, handle_system_action
 from checkpoint_supervisor import build_supervisor_context, review_checkpoints
 from cycle_checkpoint import create_checkpoint_journal
@@ -1657,23 +1658,27 @@ def run_loop(
             is_wait_only = any(kw in action for kw in _WAIT_ONLY_KEYWORDS)
             if action and not is_wait_only and not dec.get("approval_required"):
                 print(f"[LOOP] Round {lc} - need_input 但有可执行action，先执行: {action[:60]}...")
-                _emit("status", f"Round {lc} - OpenClaw executing... (等待浏览器锁)")
-                with CLAW_GLOBAL_LOCK:
-                    _emit("status", f"Round {lc} - OpenClaw executing...")
-                    try:
-                        result = claw.execute(action)
-                        print(f"[LOOP] Round {lc} - OpenClaw: success={result['success']}")
-                        last_fb = result["content"]
-                        # 记录 claw 日志
-                        state.claw_log.append({
-                            "round": lc, "time": datetime.now().strftime("%H:%M:%S"),
-                            "instruction": action, "result": last_fb[:2000],
-                            "success": result["success"],
-                        })
-                        state.save_logs()
-                    except Exception as e:
-                        print(f"[LOOP] Round {lc} - OpenClaw exception: {e}")
-                        last_fb = f"Exception: {e}"
+                try:
+                    route = classify_action(action)
+                    _emit("status", f"Round {lc} - {route.route} executing...")
+                    result = execute_routed_action(
+                        action,
+                        project_root=project_root,
+                        claw=claw,
+                        emit=_emit,
+                        lock=CLAW_GLOBAL_LOCK,
+                    )
+                    print(f"[LOOP] Round {lc} - routed({result.get('route')}): success={result['success']}")
+                    last_fb = result["content"]
+                    state.claw_log.append({
+                        "round": lc, "time": datetime.now().strftime("%H:%M:%S"),
+                        "instruction": action, "result": last_fb[:2000],
+                        "success": result["success"],
+                    })
+                    state.save_logs()
+                except Exception as e:
+                    print(f"[LOOP] Round {lc} - routed action exception: {e}")
+                    last_fb = f"Exception: {e}"
 
             # === 凭据自动应答 ===
             # 仅当问题是凭据相关时才自动应答，验证码等动态信息不匹配
@@ -1807,21 +1812,26 @@ def run_loop(
         else:
             _empty_action_count = 0  # 有 action，重置空转计数
 
-        # Execute via OpenClaw
-        _emit("status", f"Round {lc} - OpenClaw executing... (等待浏览器锁)")
-        print(f"[LOOP] Round {lc} - OpenClaw: {action[:60]}...")
-        with CLAW_GLOBAL_LOCK:
-            _emit("status", f"Round {lc} - OpenClaw executing...")
-            try:
-                result = claw.execute(action)
-                print(f"[LOOP] Round {lc} - OpenClaw: success={result['success']}")
-            except Exception as e:
-                print(f"[LOOP] Round {lc} - OpenClaw exception: {e}")
-                traceback.print_exc()
-                result = {"success": False, "content": f"Exception: {e}"}
+        # Execute via the action router: Codex / local command / OpenClaw.
+        route = classify_action(action)
+        _emit("status", f"Round {lc} - {route.route} executing...")
+        print(f"[LOOP] Round {lc} - route={route.route}: {action[:60]}...")
+        try:
+            result = execute_routed_action(
+                action,
+                project_root=project_root,
+                claw=claw,
+                emit=_emit,
+                lock=CLAW_GLOBAL_LOCK,
+            )
+            print(f"[LOOP] Round {lc} - routed({result.get('route')}): success={result['success']}")
+        except Exception as e:
+            print(f"[LOOP] Round {lc} - routed action exception: {e}")
+            traceback.print_exc()
+            result = {"success": False, "content": f"Exception: {e}", "route": route.route}
 
         # ===== 自愈管道（在验证码检测之前）=====
-        if not result["success"]:
+        if result.get("route", "openclaw") == "openclaw" and not result["success"]:
             fail_type = _classify_failure(result["content"])
             healable_types = {"timeout", "unknown", "param_error"}
             if fail_type in healable_types and lc > 1:  # 第一轮不自愈（可能是冷启动）
@@ -1844,7 +1854,7 @@ def run_loop(
                     print(f"[LOOP] Round {lc} - 自愈失败: {heal_err}")
 
         # ===== 验证码自动检测与解决 =====
-        if not result["success"]:
+        if result.get("route", "openclaw") == "openclaw" and not result["success"]:
             content_lower = result["content"].lower()
             # 只有真正的验证码关键词才触发验证码解决流程
             # 超时/封禁/网络错误不是验证码，误触发会导致截图失败→误判循环
