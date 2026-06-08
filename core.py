@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from autonomous_system import Brain, Memory, OpenClawClient
+from agent_tools import build_system_tools_context, handle_system_action
 from checkpoint_supervisor import build_supervisor_context, review_checkpoints
 from cycle_checkpoint import create_checkpoint_journal
 from decision_contract import assess_action_risk, build_decision_contract_context
+from message_center import create_message_center
 from task_contract import create_task_contract
 
 # Windows 终端默认 gbk 编码，Brain 返回的 emoji/中文会导致 print() 崩溃
@@ -1074,6 +1076,7 @@ def run_loop(
                     return
             time.sleep(1)
 
+    project_root = Path(__file__).parent
     print(f"[LOOP] start: goal={goal[:30]}..., agent={agent}, max_loops={max_loops}")
 
     _dbg("run_loop: start")
@@ -1084,9 +1087,13 @@ def run_loop(
         session_id=getattr(state, "task_id", config.session_key),
     )
     task_contract = create_task_contract(
-        Path(__file__).parent / "data" / "task_contracts",
+        project_root / "data" / "task_contracts",
         session_id=getattr(state, "task_id", config.session_key),
         goal=goal,
+    )
+    message_center = create_message_center(
+        project_root,
+        session_id=getattr(state, "task_id", config.session_key),
     )
     brain = Brain(config.brain_api_key, config.brain_base_url, config.brain_model)
     _dbg(f"run_loop: Brain init ok, model={config.brain_model}")
@@ -1222,6 +1229,48 @@ def run_loop(
 
         print(f"[LOOP] Round {lc} - start")
         _emit("status", f"Round {lc} - Brain thinking...")
+
+        try:
+            pending_cards = message_center.get_pending_cards(required_only=True)
+        except Exception as e:
+            print(f"[LOOP] Round {lc} - message center failed: {e}")
+            pending_cards = []
+        if pending_cards:
+            top_card = pending_cards[0]
+            question = top_card.question_text() or "系统需要你确认后继续。"
+            print(f"[LOOP] Round {lc} - waiting message card: {top_card.id}")
+            _emit("status", f"Round {lc} - 等待用户确认...")
+            if on_input_needed:
+                try:
+                    answer = on_input_needed(question)
+                except Exception:
+                    answer = ""
+                if answer:
+                    message_center.answer_card(top_card.id, answer)
+                    last_fb = f"[用户回答消息卡片] {top_card.title}: {answer}"
+                else:
+                    message_center.dismiss_card(top_card.id, "timeout")
+                    last_fb = f"[消息卡片超时] {top_card.title}"
+                _wait(1)
+                continue
+            with state.lock:
+                state.pending_question = question
+            state.chat_history.append({"role": "sys", "text": question})
+            state.save_logs()
+            state.answer_event.clear()
+            state.answer_event.wait(timeout=300)
+            with state.lock:
+                answer = state.user_answer
+                state.user_answer = ""
+                state.pending_question = ""
+            if answer:
+                message_center.answer_card(top_card.id, answer)
+                last_fb = f"[用户回答消息卡片] {top_card.title}: {answer}"
+            else:
+                message_center.dismiss_card(top_card.id, "timeout")
+                last_fb = f"[消息卡片超时] {top_card.title}"
+            _wait(1)
+            continue
 
         # Brain thinks
         # === 上下文构建（失败不应该计入 Brain API 熔断） ===
@@ -1388,6 +1437,8 @@ def run_loop(
                 "decision_contract": build_decision_contract_context(goal, last_fb, lc),
                 "checkpoint_context": checkpoint_journal.build_prompt_context(goal, lc),
                 "supervisor_context": supervisor_context,
+                "message_context": message_center.build_prompt_context(),
+                "system_tools": build_system_tools_context(project_root),
             }
         except Exception as e:
             print(f"[LOOP] Round {lc} - context 构建失败: {e}")
@@ -1400,6 +1451,8 @@ def run_loop(
                 "decision_contract": build_decision_contract_context(goal, last_fb, lc),
                 "checkpoint_context": checkpoint_journal.build_prompt_context(goal, lc),
                 "supervisor_context": supervisor_context,
+                "message_context": "",
+                "system_tools": build_system_tools_context(project_root),
             }
 
         # === 检查用户中途注入的消息 ===
@@ -1493,7 +1546,7 @@ def run_loop(
                 observation = (observation + "\n" if observation else "") + f"[动作压缩] {shrink_note}"
                 print(f"[LOOP] Round {lc} - action shrunk: {action}")
 
-        if action:
+        if action and not action.startswith("["):
             try:
                 action_risk = assess_action_risk(
                     action=action,
@@ -1538,6 +1591,48 @@ def run_loop(
             "action": action, "update_memory": upd, "status": st,
         })
         state.save_logs()
+
+        # Handle system-level prefixed actions before sending anything to OpenClaw.
+        if action.startswith("["):
+            try:
+                routed = handle_system_action(
+                    action,
+                    project_root=project_root,
+                    message_center=message_center,
+                    claw=claw,
+                    config=config,
+                    loop_count=lc,
+                )
+            except Exception as e:
+                routed = None
+                result = {"success": False, "content": f"系统工具异常: {e}"}
+            else:
+                result = {"success": routed.success, "content": routed.content} if routed and routed.handled else None
+
+            if result is not None:
+                print(f"[LOOP] Round {lc} - system action: success={result['success']}")
+                state.claw_log.append({
+                    "round": lc, "time": datetime.now().strftime("%H:%M:%S"),
+                    "instruction": action,
+                    "result": result["content"], "success": result["success"],
+                })
+                try:
+                    checkpoint_journal.record(
+                        goal=goal,
+                        loop_count=lc,
+                        action=action,
+                        result=result["content"],
+                        success=result["success"],
+                        thought=thought,
+                        status=st,
+                    )
+                except Exception as e:
+                    print(f"[CHECKPOINT] system action record failed: {e}")
+                mem.add_action(action, result["content"], result["success"])
+                last_fb = result["content"] if result["success"] else f"Failed: {result['content']}"
+                state.save_logs()
+                _wait(interval)
+                continue
 
         # Handle need_input
         if st == "need_input":

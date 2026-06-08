@@ -48,6 +48,7 @@ from credential_store import (
 )
 from core import SystemState, RunLoopConfig, run_loop as _core_run_loop, SessionManager
 from checkpoint_supervisor import review_checkpoints
+from message_center import latest_message_payload, open_latest_message_center
 from task_contract import read_task_contract
 from task_manager import get_task_manager, TaskManager
 
@@ -1997,6 +1998,37 @@ async def api_answer(req: Request):
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/messages")
+def api_messages():
+    _touch_activity()
+    return JSONResponse(latest_message_payload(Path(__file__).parent))
+
+
+@app.post("/api/messages/answer")
+async def api_messages_answer(req: Request):
+    _touch_activity()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误"})
+    card_id = body.get("card_id", "").strip()
+    answer = body.get("answer", "").strip()
+    if not answer:
+        return JSONResponse({"error": "回复不能为空"})
+    center = open_latest_message_center(Path(__file__).parent)
+    if not center:
+        return JSONResponse({"error": "暂无消息卡片"}, status_code=404)
+    if card_id:
+        ok = center.answer_card(card_id, answer)
+    else:
+        pending = center.get_pending_cards(required_only=True)
+        ok = bool(pending) and center.answer_card(pending[0].id, answer)
+    if not ok:
+        return JSONResponse({"error": "卡片不存在或已处理"}, status_code=404)
+    _send_command({"action": "answer", "answer": answer})
+    return JSONResponse({"ok": True, "messages": center.to_payload()})
+
+
 @app.post("/api/chat")
 async def api_chat(req: Request):
     """随时接收用户消息 - 支持即时操作和反馈注入"""
@@ -2079,6 +2111,7 @@ def api_state(task_id: str = ""):
                 "idle_timeout": IDLE_TIMEOUT_SECONDS,
                 "checkpoints": _latest_checkpoint_payload(),
                 "task_contract": _latest_task_contract_payload(last_sess.get("task_id", "") or last_sess.get("session_id", "")),
+                "messages": latest_message_payload(Path(__file__).parent),
             })
 
         return JSONResponse({
@@ -2099,6 +2132,7 @@ def api_state(task_id: str = ""):
             "idle_timeout": IDLE_TIMEOUT_SECONDS,
             "checkpoints": _latest_checkpoint_payload(),
             "task_contract": _latest_task_contract_payload(),
+            "messages": latest_message_payload(Path(__file__).parent),
         })
 
     is_alive = _is_worker_alive()
@@ -2135,6 +2169,7 @@ def api_state(task_id: str = ""):
         "idle_timeout": IDLE_TIMEOUT_SECONDS,
         "checkpoints": _latest_checkpoint_payload(),
         "task_contract": _latest_task_contract_payload(snap.get("task_id", "") or snap.get("session_id", "")),
+        "messages": latest_message_payload(Path(__file__).parent),
     })
 
 

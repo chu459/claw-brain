@@ -58,8 +58,24 @@ ClawBrain 自己应该沉淀：
 - `task_contract.py`：每个任务开始前写清目标、阶段、最低验证量、预期证据、工具策略和安全边界。
 - `decision_contract.py`：自主决策规则、最低验证量、安全门、工具策略。
 - `cycle_checkpoint.py`：主循环检查点日志。
+- `message_center.py`：把用户确认、提案、反馈做成结构化消息卡片。
+- `agent_tools.py`：处理系统级动作前缀，比如创建卡片、分发子任务、搜索记忆。
 - `core.py`：正式主循环，执行前拦截风险动作，执行后记录检查点。
 - `brain_v2.py`：把这些规则注入大脑上下文。
+
+## 系统工具层
+
+新吸收的能力不替换主循环，只作为工具层接入。
+
+Brain 可以输出这些前缀：
+
+- `[ADD_CARD:choice]`：关键选择先问用户。
+- `[ADD_CARD:proposal]`：改计划前先提案。
+- `[SPAWN_AGENT name:web-access]`：复杂网页任务交给网页子任务模板。
+- `[CREATE_AGENT name:xxx]`：把反复出现的专业任务沉淀成子 Agent。
+- `[MEMORY_SEARCH]`：先查历史记忆，再决定下一步。
+
+这样系统会更像项目负责人：会拆任务，会问关键问题，会复用工具。
 
 ## 给普通用户的体验目标
 

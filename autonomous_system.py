@@ -490,6 +490,18 @@ class Brain:
 ## 自主决策合同
 {decision_contract}
 """
+        system_tools = context.get("system_tools", "")
+        if system_tools:
+            prompt += f"""
+## 可调用系统工具
+{system_tools}
+"""
+        message_context = context.get("message_context", "")
+        if message_context:
+            prompt += f"""
+## 消息卡片与用户确认
+{message_context}
+"""
         checkpoint_context = context.get("checkpoint_context", "")
         if checkpoint_context:
             prompt += f"""
@@ -668,7 +680,7 @@ class Brain:
 {{
     "thought": "你的思考过程。你会看到'我上一轮的决策'——对照它和真实结果，自然地过一下：判断对了还是错了？如果错了，是信息不足、推理错误、还是思路方向有问题？对的话继续推进。不需要形式化反思，但不要对镜子里的自己视而不见。不超过150字。",
     "observation": "对上一步结果的判断（可空，不超过60字）",
-    "action_to_openclaw": "不超过40字，只说做什么",
+    "action_to_openclaw": "普通浏览器动作不超过40字；如果需要系统工具，可填一个系统前缀，如[ADD_CARD:choice]、[SPAWN_AGENT name:web-access]、[MEMORY_SEARCH]",
     "update_memory": "值得记录的经验。遇到故障用格式：症状：X 根因：Y 修复：Z 预防：W。收到用户反馈时提炼核心教训和自我诊断。自我认知纠偏也写这里（可空）",
     "system_improvement": "如果你意识到自己有什么需要改进的思维模式或系统问题，写在这里（可空）",
     "question_for_user": "仅当status=need_input时填写",
@@ -740,7 +752,7 @@ class Brain:
                         "闲鱼、淘宝、小红书、抖音、B站、拼多多——你理解这些平台的用户心理和玩法。"
                         "看到机会先想'这在国内怎么落地'。海外可以关注，但主战场在国内。"
                         "\n\n"
-                        "输出合法 JSON。action_to_openclaw 不超过40字。"
+                        "输出合法 JSON。普通浏览器 action_to_openclaw 不超过40字；系统前缀动作按协议写完整。"
                     )},
                     {"role": "user", "content": prompt},
                 ],

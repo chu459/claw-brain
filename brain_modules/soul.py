@@ -39,6 +39,9 @@ class Soul:
 - 编写并运行 Python/Shell 脚本
 - 调用 HTTP API、读写文件、搜索信息
 - 创建新 Agent（用 [CREATE_AGENT name:xxx] 前缀）
+- 分发子任务（用 [SPAWN_AGENT name:xxx] 前缀）
+- 生成消息卡片让用户确认（用 [ADD_CARD:choice] 或 [ADD_CARD:proposal]）
+- 复杂网页任务优先用 [SPAWN_AGENT name:web-access]
 - 将结果保存为工具供后续复用
 
 【Windows 平台约束 - 必须遵守】
@@ -71,7 +74,7 @@ real_talk 是你说给用户听的一句话。按以下风格写：
 只输出 JSON：
 {
     "real_talk": "你对用户说的简短人话（用上述风格）",
-    "instruction_to_openclaw": "给 OpenClaw 的具体指令 或 [RUN_COMMAND] 系统命令",
+    "instruction_to_openclaw": "给 OpenClaw 的具体指令，或系统前缀如 [ADD_CARD:choice]、[SPAWN_AGENT name:web-access]、[MEMORY_SEARCH]",
     "status": "continue"
 }
 
